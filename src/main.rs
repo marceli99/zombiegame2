@@ -5,6 +5,7 @@ mod map;
 mod menu;
 mod net;
 mod pause;
+mod pixelart;
 mod player;
 mod sync;
 mod ui;
@@ -14,9 +15,11 @@ mod zombie;
 use bevy::prelude::*;
 use bevy::render::camera::ScalingMode;
 use bevy::time::Fixed;
-use bevy::window::WindowResizeConstraints;
+use bevy::window::{PrimaryWindow, WindowResizeConstraints};
 
-use crate::net::NetMode;
+use crate::map::{MAP_HEIGHT, MAP_WIDTH};
+use crate::net::{NetContext, NetMode};
+use crate::player::Player;
 
 pub const WINDOW_WIDTH: f32 = 1280.0;
 pub const WINDOW_HEIGHT: f32 = 720.0;
@@ -108,6 +111,10 @@ fn main() {
             ui::UiPlugin,
         ))
         .add_systems(Startup, setup_camera)
+        .add_systems(
+            Update,
+            camera_follow.run_if(in_state(GameState::Playing)),
+        )
         .run();
 }
 
@@ -115,4 +122,41 @@ fn setup_camera(mut commands: Commands) {
     let mut camera = Camera2dBundle::default();
     camera.projection.scaling_mode = ScalingMode::FixedVertical(WINDOW_HEIGHT);
     commands.spawn(camera);
+}
+
+fn camera_follow(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    ctx: Res<NetContext>,
+    players: Query<(&Transform, &Player), Without<Camera>>,
+    mut camera: Query<&mut Transform, With<Camera>>,
+) {
+    let Ok(window) = windows.get_single() else {
+        return;
+    };
+    let Ok(mut cam_transform) = camera.get_single_mut() else {
+        return;
+    };
+
+    let target = players
+        .iter()
+        .find(|(_, p)| p.id == ctx.my_id)
+        .or_else(|| players.iter().next())
+        .map(|(t, _)| t.translation.truncate());
+    let Some(target) = target else {
+        return;
+    };
+
+    let view_h = WINDOW_HEIGHT;
+    let aspect = if window.height() > 0.0 {
+        window.width() / window.height()
+    } else {
+        WINDOW_WIDTH / WINDOW_HEIGHT
+    };
+    let view_w = view_h * aspect;
+
+    let max_x = (MAP_WIDTH / 2.0 - view_w / 2.0).max(0.0);
+    let max_y = (MAP_HEIGHT / 2.0 - view_h / 2.0).max(0.0);
+
+    cam_transform.translation.x = target.x.clamp(-max_x, max_x);
+    cam_transform.translation.y = target.y.clamp(-max_y, max_y);
 }

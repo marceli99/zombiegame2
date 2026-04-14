@@ -1,16 +1,21 @@
 use bevy::prelude::*;
-use bevy::sprite::{MaterialMesh2dBundle, Mesh2dHandle};
 use bevy::window::PrimaryWindow;
+
+use std::collections::HashSet;
 
 use crate::audio::SfxEvent;
 use crate::bullet::ShootEvent;
+use crate::map::{MapObstacles, MAP_HEIGHT, MAP_WIDTH};
 use crate::net::{
     is_authoritative, LocalInput, NetContext, NetEntities, NetMode, RemoteInputs,
 };
-use crate::{gameplay_active, GameState, Score, WINDOW_HEIGHT, WINDOW_WIDTH};
+use crate::pixelart::{Canvas, Rgba};
+use crate::{gameplay_active, GameState, Score};
 
-pub const PLAYER_RADIUS: f32 = 16.0;
-pub const PLAYER_SPEED: f32 = 280.0;
+const PLAYER_SPRITE_SIZE: Vec2 = Vec2::new(30.0, 25.0);
+
+pub const PLAYER_RADIUS: f32 = 10.0;
+pub const PLAYER_SPEED: f32 = 260.0;
 pub const PLAYER_MAX_HP: i32 = 100;
 pub const PLAYER_FIRE_COOLDOWN: f32 = 0.15;
 pub const PLAYER_INVULN: f32 = 0.5;
@@ -32,16 +37,7 @@ pub struct PlayerDamagedEvent {
 
 #[derive(Resource)]
 pub struct PlayerAssets {
-    pub body_mesh: Handle<Mesh>,
-    pub jacket_mesh: Handle<Mesh>,
-    pub head_mesh: Handle<Mesh>,
-    pub hair_mesh: Handle<Mesh>,
-    pub gun_mesh: Handle<Mesh>,
-    pub muzzle_mesh: Handle<Mesh>,
-    pub head_mat: Handle<ColorMaterial>,
-    pub hair_mat: Handle<ColorMaterial>,
-    pub gun_mat: Handle<ColorMaterial>,
-    pub muzzle_mat: Handle<ColorMaterial>,
+    pub images: [Handle<Image>; 4],
 }
 
 pub struct PlayerPlugin;
@@ -66,59 +62,96 @@ impl Plugin for PlayerPlugin {
     }
 }
 
-fn setup_player_assets(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-) {
-    commands.insert_resource(PlayerAssets {
-        body_mesh: meshes.add(Rectangle::new(18.0, 18.0)),
-        jacket_mesh: meshes.add(Rectangle::new(14.0, 6.0)),
-        head_mesh: meshes.add(Rectangle::new(11.0, 11.0)),
-        hair_mesh: meshes.add(Rectangle::new(11.0, 3.0)),
-        gun_mesh: meshes.add(Rectangle::new(16.0, 4.0)),
-        muzzle_mesh: meshes.add(Rectangle::new(3.0, 3.0)),
-        head_mat: materials.add(Color::srgb(0.85, 0.68, 0.52)),
-        hair_mat: materials.add(Color::srgb(0.22, 0.12, 0.06)),
-        gun_mat: materials.add(Color::srgb(0.18, 0.18, 0.22)),
-        muzzle_mat: materials.add(Color::srgb(0.68, 0.68, 0.72)),
-    });
+fn setup_player_assets(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
+    let imgs: [Handle<Image>; 4] = [
+        images.add(build_player_image(0)),
+        images.add(build_player_image(1)),
+        images.add(build_player_image(2)),
+        images.add(build_player_image(3)),
+    ];
+    commands.insert_resource(PlayerAssets { images: imgs });
 }
 
-fn player_body_colors(id: u8) -> (Color, Color) {
+fn player_palette(id: u8) -> (Rgba, Rgba, Rgba) {
     match id % 4 {
         0 => (
-            Color::srgb(0.18, 0.26, 0.48),
-            Color::srgb(0.10, 0.16, 0.32),
+            [100, 145, 230, 255],
+            [60, 95, 175, 255],
+            [32, 55, 110, 255],
         ),
         1 => (
-            Color::srgb(0.52, 0.18, 0.18),
-            Color::srgb(0.34, 0.10, 0.10),
+            [225, 90, 75, 255],
+            [170, 55, 50, 255],
+            [95, 24, 24, 255],
         ),
         2 => (
-            Color::srgb(0.20, 0.46, 0.22),
-            Color::srgb(0.10, 0.30, 0.12),
+            [110, 190, 90, 255],
+            [65, 135, 60, 255],
+            [35, 80, 32, 255],
         ),
         _ => (
-            Color::srgb(0.58, 0.52, 0.14),
-            Color::srgb(0.38, 0.32, 0.08),
+            [235, 195, 60, 255],
+            [180, 140, 35, 255],
+            [105, 78, 18, 255],
         ),
     }
+}
+
+fn build_player_image(id: u8) -> Image {
+    let (body_light, body_main, body_dark) = player_palette(id);
+    let outline: Rgba = [14, 12, 8, 255];
+    let skin: Rgba = [232, 196, 148, 255];
+    let skin_light: Rgba = [252, 222, 184, 255];
+    let hair: Rgba = [36, 22, 12, 255];
+    let gun: Rgba = [46, 46, 56, 255];
+    let gun_light: Rgba = [92, 92, 104, 255];
+    let stock: Rgba = [118, 72, 30, 255];
+    let stock_dark: Rgba = [72, 42, 15, 255];
+
+    let mut c = Canvas::new(25, 21);
+
+    c.fill_circle(12, 10, 8, outline);
+    c.fill_circle(12, 10, 7, body_dark);
+    c.fill_circle(12, 10, 6, body_main);
+    c.fill_circle(10, 8, 3, body_light);
+
+    c.fill_rect(10, 8, 3, 5, body_dark);
+    c.put(11, 10, body_main);
+
+    c.fill_rect(17, 9, 4, 3, stock_dark);
+    c.fill_rect(17, 9, 4, 1, stock);
+    c.put(17, 10, stock);
+
+    c.fill_rect(19, 10, 6, 2, gun);
+    c.fill_rect(19, 10, 6, 1, gun_light);
+    c.put(24, 10, outline);
+    c.put(24, 11, outline);
+
+    c.fill_circle(15, 10, 3, outline);
+    c.fill_circle(15, 10, 2, skin);
+    c.put(16, 9, skin_light);
+
+    c.fill_rect(12, 8, 2, 5, hair);
+    c.put(13, 8, outline);
+    c.put(13, 12, outline);
+
+    c.into_image()
 }
 
 pub fn spawn_player_entity(
     commands: &mut Commands,
     assets: &PlayerAssets,
-    materials: &mut Assets<ColorMaterial>,
     id: u8,
     pos: Vec2,
 ) -> Entity {
-    let (body_col, jacket_col) = player_body_colors(id);
-    let body_mat = materials.add(body_col);
-    let jacket_mat = materials.add(jacket_col);
     commands
         .spawn((
-            SpatialBundle {
+            SpriteBundle {
+                texture: assets.images[(id as usize) % 4].clone(),
+                sprite: Sprite {
+                    custom_size: Some(PLAYER_SPRITE_SIZE),
+                    ..default()
+                },
                 transform: Transform::from_xyz(pos.x, pos.y, 10.0),
                 ..default()
             },
@@ -130,51 +163,12 @@ pub fn spawn_player_entity(
                 aim: Vec2::X,
             },
         ))
-        .with_children(|parent| {
-            parent.spawn(MaterialMesh2dBundle {
-                mesh: Mesh2dHandle(assets.body_mesh.clone()),
-                material: body_mat,
-                transform: Transform::from_xyz(0.0, 0.0, 0.0),
-                ..default()
-            });
-            parent.spawn(MaterialMesh2dBundle {
-                mesh: Mesh2dHandle(assets.jacket_mesh.clone()),
-                material: jacket_mat,
-                transform: Transform::from_xyz(-1.0, -5.0, 0.1),
-                ..default()
-            });
-            parent.spawn(MaterialMesh2dBundle {
-                mesh: Mesh2dHandle(assets.head_mesh.clone()),
-                material: assets.head_mat.clone(),
-                transform: Transform::from_xyz(2.0, 0.0, 1.0),
-                ..default()
-            });
-            parent.spawn(MaterialMesh2dBundle {
-                mesh: Mesh2dHandle(assets.hair_mesh.clone()),
-                material: assets.hair_mat.clone(),
-                transform: Transform::from_xyz(-1.0, 0.0, 1.1),
-                ..default()
-            });
-            parent.spawn(MaterialMesh2dBundle {
-                mesh: Mesh2dHandle(assets.gun_mesh.clone()),
-                material: assets.gun_mat.clone(),
-                transform: Transform::from_xyz(14.0, 0.0, 0.5),
-                ..default()
-            });
-            parent.spawn(MaterialMesh2dBundle {
-                mesh: Mesh2dHandle(assets.muzzle_mesh.clone()),
-                material: assets.muzzle_mat.clone(),
-                transform: Transform::from_xyz(22.0, 0.0, 0.6),
-                ..default()
-            });
-        })
         .id()
 }
 
 fn spawn_players(
     mut commands: Commands,
     assets: Res<PlayerAssets>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
     mut score: ResMut<Score>,
     net: Res<NetMode>,
     ctx: Res<NetContext>,
@@ -196,8 +190,8 @@ fn spawn_players(
     };
 
     for (idx, id) in ids.iter().enumerate() {
-        let pos = Vec2::new(-220.0 + idx as f32 * 120.0, 0.0);
-        let ent = spawn_player_entity(&mut commands, &assets, &mut materials, *id, pos);
+        let pos = Vec2::new(0.0, -260.0 + idx as f32 * 170.0);
+        let ent = spawn_player_entity(&mut commands, &assets, *id, pos);
         net_entities.players.insert(*id, ent);
     }
 }
@@ -273,6 +267,7 @@ fn server_player_tick(
     local: Res<LocalInput>,
     remote: Res<RemoteInputs>,
     ctx: Res<NetContext>,
+    obstacles: Res<MapObstacles>,
     mut players: Query<(&mut Transform, &mut Player)>,
     mut shoot_events: EventWriter<ShootEvent>,
     mut sfx: EventWriter<SfxEvent>,
@@ -294,10 +289,15 @@ fn server_player_tick(
         if mv != Vec2::ZERO {
             transform.translation += (mv * PLAYER_SPEED * dt).extend(0.0);
         }
-        let half_w = WINDOW_WIDTH / 2.0 - PLAYER_RADIUS;
-        let half_h = WINDOW_HEIGHT / 2.0 - PLAYER_RADIUS;
+        let half_w = MAP_WIDTH / 2.0 - PLAYER_RADIUS;
+        let half_h = MAP_HEIGHT / 2.0 - PLAYER_RADIUS;
         transform.translation.x = transform.translation.x.clamp(-half_w, half_w);
         transform.translation.y = transform.translation.y.clamp(-half_h, half_h);
+
+        let mut pos = transform.translation.truncate();
+        obstacles.resolve(&mut pos, PLAYER_RADIUS);
+        transform.translation.x = pos.x.clamp(-half_w, half_w);
+        transform.translation.y = pos.y.clamp(-half_h, half_h);
 
         let aim = Vec2::new(input.aim_x, input.aim_y);
         let aim = if aim.length_squared() > 0.0001 {
@@ -328,14 +328,16 @@ fn server_player_tick(
 }
 
 fn player_damage_handler(
+    mut commands: Commands,
     mut events: EventReader<PlayerDamagedEvent>,
-    mut players: Query<&mut Player>,
+    mut players: Query<(Entity, &mut Player)>,
+    mut net_entities: ResMut<NetEntities>,
     mut sfx: EventWriter<SfxEvent>,
     mut next_state: ResMut<NextState<GameState>>,
 ) {
-    let mut any_dead = false;
+    let mut newly_dead: HashSet<u8> = HashSet::new();
     for ev in events.read() {
-        for mut player in &mut players {
+        for (_, mut player) in &mut players {
             if player.id != ev.target_id {
                 continue;
             }
@@ -346,14 +348,26 @@ fn player_damage_handler(
             player.invuln_timer = PLAYER_INVULN;
             sfx.send(SfxEvent::PlayerHit);
             if player.hp <= 0 {
-                any_dead = true;
+                newly_dead.insert(player.id);
             }
         }
     }
-    if any_dead {
-        let all_dead = players.iter().all(|p| p.hp <= 0);
-        if all_dead {
-            next_state.set(GameState::GameOver);
+    if newly_dead.is_empty() {
+        return;
+    }
+
+    for (entity, player) in &players {
+        if newly_dead.contains(&player.id) {
+            commands.entity(entity).despawn_recursive();
+            net_entities.players.remove(&player.id);
         }
+    }
+
+    let survivors = players
+        .iter()
+        .filter(|(_, p)| p.hp > 0 && !newly_dead.contains(&p.id))
+        .count();
+    if survivors == 0 {
+        next_state.set(GameState::GameOver);
     }
 }

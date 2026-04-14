@@ -138,7 +138,6 @@ fn client_apply_snapshots(
     player_assets: Res<PlayerAssets>,
     zombie_assets: Res<ZombieAssets>,
     bullet_assets: Res<BulletAssets>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
     mut players: Query<
         (&mut Transform, &mut Player),
         (Without<Zombie>, Without<Bullet>),
@@ -214,7 +213,6 @@ fn client_apply_snapshots(
                 let ent = spawn_player_entity(
                     &mut commands,
                     &player_assets,
-                    &mut materials,
                     np.id,
                     Vec2::new(np.x, np.y),
                 );
@@ -301,7 +299,7 @@ fn client_apply_snapshots(
         .collect();
     for k in stale_bullets {
         if let Some(ent) = net_entities.bullets.remove(&k) {
-            commands.entity(ent).despawn();
+            commands.entity(ent).despawn_recursive();
         }
     }
 

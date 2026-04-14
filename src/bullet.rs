@@ -1,13 +1,16 @@
 use bevy::prelude::*;
-use bevy::sprite::{MaterialMesh2dBundle, Mesh2dHandle};
 
 use crate::audio::SfxEvent;
+use crate::map::MapObstacles;
 use crate::net::{is_authoritative, NetContext, NetId};
+use crate::pixelart::{Canvas, Rgba};
 use crate::zombie::{Zombie, ZombieKilledEvent, ZOMBIE_RADIUS};
 use crate::{gameplay_active, GameState, Score};
 
+const BULLET_SPRITE_SIZE: Vec2 = Vec2::new(14.0, 6.0);
+
 pub const BULLET_SPEED: f32 = 720.0;
-pub const BULLET_RADIUS: f32 = 4.0;
+pub const BULLET_RADIUS: f32 = 3.0;
 pub const BULLET_DAMAGE: i32 = 1;
 pub const BULLET_LIFETIME: f32 = 1.4;
 
@@ -26,8 +29,7 @@ pub struct ShootEvent {
 
 #[derive(Resource)]
 pub struct BulletAssets {
-    pub mesh: Handle<Mesh>,
-    pub material: Handle<ColorMaterial>,
+    pub image: Handle<Image>,
 }
 
 pub struct BulletPlugin;
@@ -47,15 +49,49 @@ impl Plugin for BulletPlugin {
     }
 }
 
-fn setup_bullet_assets(
-    mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<ColorMaterial>>,
-) {
+fn setup_bullet_assets(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
     commands.insert_resource(BulletAssets {
-        mesh: meshes.add(Rectangle::new(7.0, 3.0)),
-        material: materials.add(Color::srgb(1.0, 0.92, 0.35)),
+        image: images.add(build_bullet_image()),
     });
+}
+
+fn build_bullet_image() -> Image {
+    let trail: Rgba = [220, 80, 20, 180];
+    let trail_dim: Rgba = [140, 50, 10, 110];
+    let glow: Rgba = [255, 180, 40, 255];
+    let core: Rgba = [255, 245, 160, 255];
+    let tip: Rgba = [255, 255, 220, 255];
+
+    let mut c = Canvas::new(11, 5);
+
+    c.put(0, 2, trail_dim);
+    c.put(1, 2, trail_dim);
+    c.put(2, 2, trail);
+    c.put(3, 2, trail);
+    c.put(1, 1, trail_dim);
+    c.put(2, 1, trail_dim);
+    c.put(1, 3, trail_dim);
+    c.put(2, 3, trail_dim);
+
+    c.put(4, 2, glow);
+    c.put(5, 2, glow);
+    c.put(3, 1, trail);
+    c.put(3, 3, trail);
+    c.put(4, 1, glow);
+    c.put(4, 3, glow);
+
+    c.put(6, 2, core);
+    c.put(7, 2, core);
+    c.put(8, 2, core);
+    c.put(5, 1, glow);
+    c.put(5, 3, glow);
+    c.put(6, 1, glow);
+    c.put(6, 3, glow);
+
+    c.put(9, 2, tip);
+    c.put(10, 2, tip);
+
+    c.into_image()
 }
 
 pub fn spawn_bullet_entity(
@@ -68,9 +104,12 @@ pub fn spawn_bullet_entity(
     let angle = direction.y.atan2(direction.x);
     commands
         .spawn((
-            MaterialMesh2dBundle {
-                mesh: Mesh2dHandle(assets.mesh.clone()),
-                material: assets.material.clone(),
+            SpriteBundle {
+                texture: assets.image.clone(),
+                sprite: Sprite {
+                    custom_size: Some(BULLET_SPRITE_SIZE),
+                    ..default()
+                },
                 transform: Transform::from_xyz(origin.x, origin.y, 8.0)
                     .with_rotation(Quat::from_rotation_z(angle)),
                 ..default()
@@ -100,6 +139,7 @@ fn shoot_listener(
 fn bullet_movement(
     mut commands: Commands,
     time: Res<Time>,
+    obstacles: Res<MapObstacles>,
     mut q: Query<(Entity, &mut Transform, &mut Bullet)>,
 ) {
     let dt = time.delta_seconds();
@@ -107,7 +147,11 @@ fn bullet_movement(
         transform.translation += (bullet.velocity * dt).extend(0.0);
         bullet.lifetime -= dt;
         if bullet.lifetime <= 0.0 {
-            commands.entity(entity).despawn();
+            commands.entity(entity).despawn_recursive();
+            continue;
+        }
+        if obstacles.hits(transform.translation.truncate(), BULLET_RADIUS) {
+            commands.entity(entity).despawn_recursive();
         }
     }
 }
@@ -129,7 +173,7 @@ fn bullet_collision(
             let zp = z_transform.translation.truncate();
             if bp.distance(zp) < BULLET_RADIUS + ZOMBIE_RADIUS {
                 zombie.hp -= bullet.damage;
-                commands.entity(b_entity).despawn();
+                commands.entity(b_entity).despawn_recursive();
                 sfx.send(SfxEvent::Hit);
                 if zombie.hp <= 0 {
                     commands.entity(z_entity).despawn_recursive();
@@ -145,6 +189,6 @@ fn bullet_collision(
 
 fn despawn_all_bullets(mut commands: Commands, q: Query<Entity, With<Bullet>>) {
     for e in &q {
-        commands.entity(e).despawn();
+        commands.entity(e).despawn_recursive();
     }
 }
