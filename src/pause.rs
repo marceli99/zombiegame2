@@ -86,7 +86,7 @@ fn spawn_pause_ui(mut commands: Commands, assets: Res<UiAssets>) {
         .with_children(|parent| {
             parent.spawn(
                 TextBundle::from_section(
-                    "PAUZA",
+                    "PAUSED",
                     TextStyle {
                         font: font.clone(),
                         font_size: 56.0,
@@ -99,7 +99,7 @@ fn spawn_pause_ui(mut commands: Commands, assets: Res<UiAssets>) {
                 }),
             );
             parent.spawn(TextBundle::from_section(
-                "ESC - kontynuuj",
+                "ESC - resume",
                 TextStyle {
                     font: font.clone(),
                     font_size: 18.0,
@@ -107,7 +107,7 @@ fn spawn_pause_ui(mut commands: Commands, assets: Res<UiAssets>) {
                 },
             ));
             parent.spawn(TextBundle::from_section(
-                "Q - menu glowne",
+                "Q - main menu",
                 TextStyle {
                     font,
                     font_size: 18.0,

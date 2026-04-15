@@ -173,7 +173,7 @@ fn spawn_hud(mut commands: Commands, assets: Res<UiAssets>) {
                 })
                 .with_children(|panel| {
                     panel.spawn((
-                        TextBundle::from_section("FALA 1", wave_style.clone()),
+                        TextBundle::from_section("WAVE 1", wave_style.clone()),
                         WaveTitleText,
                     ));
                     panel.spawn((
@@ -270,11 +270,11 @@ fn update_hud(
     }
     if let Ok(mut text) = wave_title.get_single_mut() {
         text.sections[0].value = if wave.in_break && wave.current_wave == 0 {
-            "PRZYGOTUJ SIE".to_string()
+            "GET READY".to_string()
         } else if wave.in_break {
-            format!("FALA {} ZA...", wave.current_wave + 1)
+            format!("WAVE {} IN...", wave.current_wave + 1)
         } else {
-            format!("FALA {}", wave.current_wave)
+            format!("WAVE {}", wave.current_wave)
         };
     }
     if let Ok(mut text) = wave_status.get_single_mut() {
@@ -283,7 +283,7 @@ fn update_hud(
         } else {
             let alive = zombies.iter().count();
             let left = wave.zombies_to_spawn as usize + alive;
-            format!("ZOMBIE: {left}")
+            format!("ZOMBIES: {left}")
         };
     }
     if let Ok(mut text) = score_text.get_single_mut() {
@@ -325,7 +325,7 @@ fn spawn_game_over(
                 },
             ));
             parent.spawn(TextBundle::from_section(
-                format!("FALA {}    SCORE {}", wave.current_wave, score.0),
+                format!("WAVE {}    SCORE {}", wave.current_wave, score.0),
                 TextStyle {
                     font: font.clone(),
                     font_size: 22.0,
@@ -333,7 +333,7 @@ fn spawn_game_over(
                 },
             ));
             parent.spawn(TextBundle::from_section(
-                "SPACJA - menu glowne",
+                "SPACE - main menu",
                 TextStyle {
                     font,
                     font_size: 16.0,

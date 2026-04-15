@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
+use rand::Rng;
 
 use std::collections::HashSet;
 
@@ -10,6 +11,7 @@ use crate::net::{
     is_authoritative, LocalInput, NetContext, NetEntities, NetMode, RemoteInputs,
 };
 use crate::pixelart::{Canvas, Rgba};
+use crate::weapon::Weapon;
 use crate::{gameplay_active, GameState, Score};
 
 const PLAYER_SPRITE_SIZE: Vec2 = Vec2::new(30.0, 25.0);
@@ -17,7 +19,6 @@ const PLAYER_SPRITE_SIZE: Vec2 = Vec2::new(30.0, 25.0);
 pub const PLAYER_RADIUS: f32 = 10.0;
 pub const PLAYER_SPEED: f32 = 260.0;
 pub const PLAYER_MAX_HP: i32 = 100;
-pub const PLAYER_FIRE_COOLDOWN: f32 = 0.15;
 pub const PLAYER_INVULN: f32 = 0.5;
 
 #[derive(Component)]
@@ -27,6 +28,7 @@ pub struct Player {
     pub fire_cooldown: f32,
     pub invuln_timer: f32,
     pub aim: Vec2,
+    pub weapon: Weapon,
 }
 
 #[derive(Event)]
@@ -161,6 +163,7 @@ pub fn spawn_player_entity(
                 fire_cooldown: 0.0,
                 invuln_timer: 0.0,
                 aim: Vec2::X,
+                weapon: Weapon::Pistol,
             },
         ))
         .id()
@@ -190,7 +193,7 @@ fn spawn_players(
     };
 
     for (idx, id) in ids.iter().enumerate() {
-        let pos = Vec2::new(0.0, -260.0 + idx as f32 * 170.0);
+        let pos = Vec2::new(0.0, -100.0 + idx as f32 * 70.0);
         let ent = spawn_player_entity(&mut commands, &assets, *id, pos);
         net_entities.players.insert(*id, ent);
     }
@@ -316,12 +319,32 @@ fn server_player_tick(
         }
 
         if input.shoot && player.fire_cooldown <= 0.0 && player.hp > 0 {
-            player.fire_cooldown = PLAYER_FIRE_COOLDOWN;
+            let weapon = player.weapon;
+            player.fire_cooldown = weapon.fire_cooldown();
             let origin = transform.translation.truncate() + player.aim * (PLAYER_RADIUS + 8.0);
-            shoot_events.send(ShootEvent {
-                origin,
-                direction: player.aim,
-            });
+            let count = weapon.bullet_count();
+            let spread = weapon.spread();
+            let damage = weapon.bullet_damage();
+            let speed = weapon.bullet_speed();
+            let mut rng = rand::thread_rng();
+            for _ in 0..count {
+                let angle = if spread > 0.0 {
+                    rng.gen_range(-spread..spread)
+                } else {
+                    0.0
+                };
+                let (sin, cos) = angle.sin_cos();
+                let dir = Vec2::new(
+                    player.aim.x * cos - player.aim.y * sin,
+                    player.aim.x * sin + player.aim.y * cos,
+                );
+                shoot_events.send(ShootEvent {
+                    origin,
+                    direction: dir,
+                    damage,
+                    speed,
+                });
+            }
             sfx.send(SfxEvent::Shot);
         }
     }

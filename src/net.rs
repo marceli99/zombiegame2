@@ -44,6 +44,7 @@ pub struct NetSnapshot {
     pub players: Vec<NetPlayerState>,
     pub zombies: Vec<NetZombieState>,
     pub bullets: Vec<NetBulletState>,
+    pub pickups: Vec<NetPickupState>,
     pub score: u32,
     pub wave: u32,
     pub in_break: bool,
@@ -59,6 +60,7 @@ pub struct NetPlayerState {
     pub y: f32,
     pub rot: f32,
     pub hp: i32,
+    pub weapon: u8,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -75,6 +77,14 @@ pub struct NetBulletState {
     pub x: f32,
     pub y: f32,
     pub rot: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct NetPickupState {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub kind: u8,
 }
 
 #[derive(Resource, Default, PartialEq, Eq, Clone, Copy, Debug)]
@@ -125,6 +135,7 @@ pub struct NetContext {
     pub lobby_players: Vec<u8>,
     pub next_zombie_net_id: u32,
     pub next_bullet_net_id: u32,
+    pub next_pickup_net_id: u32,
 }
 
 impl NetContext {
@@ -136,9 +147,14 @@ impl NetContext {
         self.next_bullet_net_id = self.next_bullet_net_id.wrapping_add(1);
         self.next_bullet_net_id
     }
+    pub fn alloc_pickup_id(&mut self) -> u32 {
+        self.next_pickup_net_id = self.next_pickup_net_id.wrapping_add(1);
+        self.next_pickup_net_id
+    }
     pub fn reset_alloc(&mut self) {
         self.next_zombie_net_id = 0;
         self.next_bullet_net_id = 0;
+        self.next_pickup_net_id = 0;
     }
     pub fn disconnect(&mut self) {
         self.host = None;
@@ -160,6 +176,7 @@ pub struct NetEntities {
     pub players: HashMap<u8, Entity>,
     pub zombies: HashMap<u32, Entity>,
     pub bullets: HashMap<u32, Entity>,
+    pub pickups: HashMap<u32, Entity>,
 }
 
 impl NetEntities {
@@ -167,6 +184,7 @@ impl NetEntities {
         self.players.clear();
         self.zombies.clear();
         self.bullets.clear();
+        self.pickups.clear();
     }
 }
 

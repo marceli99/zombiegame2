@@ -9,9 +9,7 @@ use crate::{gameplay_active, GameState, Score};
 
 const BULLET_SPRITE_SIZE: Vec2 = Vec2::new(14.0, 6.0);
 
-pub const BULLET_SPEED: f32 = 720.0;
 pub const BULLET_RADIUS: f32 = 3.0;
-pub const BULLET_DAMAGE: i32 = 1;
 pub const BULLET_LIFETIME: f32 = 1.4;
 
 #[derive(Component)]
@@ -25,6 +23,8 @@ pub struct Bullet {
 pub struct ShootEvent {
     pub origin: Vec2,
     pub direction: Vec2,
+    pub damage: i32,
+    pub speed: f32,
 }
 
 #[derive(Resource)]
@@ -99,6 +99,8 @@ pub fn spawn_bullet_entity(
     assets: &BulletAssets,
     origin: Vec2,
     direction: Vec2,
+    speed: f32,
+    damage: i32,
     net_id: u32,
 ) -> Entity {
     let angle = direction.y.atan2(direction.x);
@@ -115,9 +117,9 @@ pub fn spawn_bullet_entity(
                 ..default()
             },
             Bullet {
-                velocity: direction * BULLET_SPEED,
+                velocity: direction * speed,
                 lifetime: BULLET_LIFETIME,
-                damage: BULLET_DAMAGE,
+                damage,
             },
             NetId(net_id),
         ))
@@ -132,7 +134,15 @@ fn shoot_listener(
 ) {
     for ev in events.read() {
         let net_id = ctx.alloc_bullet_id();
-        spawn_bullet_entity(&mut commands, &assets, ev.origin, ev.direction, net_id);
+        spawn_bullet_entity(
+            &mut commands,
+            &assets,
+            ev.origin,
+            ev.direction,
+            ev.speed,
+            ev.damage,
+            net_id,
+        );
     }
 }
 

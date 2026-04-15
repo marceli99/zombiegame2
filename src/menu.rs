@@ -1,8 +1,9 @@
-use bevy::app::AppExit;
 use bevy::prelude::*;
 use std::net::{IpAddr, SocketAddr};
 
+use crate::audio::SfxEvent;
 use crate::net::{start_client, start_host, NetContext, NetMode, NET_PORT};
+use crate::settings::GraphicsSettings;
 use crate::{GameState, UiAssets};
 
 #[derive(Component)]
@@ -25,8 +26,24 @@ pub struct JoinPromptIpText;
 #[derive(Component)]
 pub struct JoinPromptErrorText;
 
+#[derive(Component)]
+pub struct SettingsRoot;
+
+#[derive(Component)]
+pub struct SettingsRow {
+    pub index: usize,
+}
+
+#[derive(Component)]
+pub struct SettingsValueText {
+    pub index: usize,
+}
+
 #[derive(Resource, Default)]
 pub struct MenuSelection(pub usize);
+
+#[derive(Resource, Default)]
+pub struct SettingsSelection(pub usize);
 
 #[derive(Resource)]
 pub struct MenuError(pub String);
@@ -52,13 +69,44 @@ impl Default for JoinAddress {
     }
 }
 
-const ITEMS: [&str; 4] = ["SINGLE PLAYER", "HOST LAN", "DOLACZ LAN", "WYJSCIE"];
+const ITEMS: [&str; 5] = [
+    "SINGLE PLAYER",
+    "HOST LAN",
+    "JOIN LAN",
+    "SETTINGS",
+    "QUIT",
+];
+
+const SETTINGS_ROW_COUNT: usize = 5;
+const SETTINGS_LABELS: [&str; SETTINGS_ROW_COUNT] = [
+    "RESOLUTION",
+    "WINDOW MODE",
+    "VSYNC",
+    "FPS LIMIT",
+    "BACK",
+];
+
+const BG_COLOR: Color = Color::srgb(0.012, 0.016, 0.022);
+const PANEL_COLOR: Color = Color::srgba(0.035, 0.04, 0.05, 0.94);
+const PANEL_BORDER: Color = Color::srgb(0.22, 0.28, 0.32);
+const PANEL_BORDER_DARK: Color = Color::srgb(0.08, 0.1, 0.12);
+const ACCENT: Color = Color::srgb(0.42, 0.12, 0.08);
+const ACCENT_DIM: Color = Color::srgb(0.22, 0.07, 0.05);
+const TITLE_SHADOW: Color = Color::srgba(0.0, 0.0, 0.0, 0.95);
+const TEXT_DIM: Color = Color::srgb(0.32, 0.34, 0.38);
+const TEXT_NORMAL: Color = Color::srgb(0.55, 0.58, 0.62);
+const TEXT_HIGHLIGHT: Color = Color::srgb(0.82, 0.72, 0.28);
+const TEXT_SUBTITLE: Color = Color::srgb(0.48, 0.36, 0.2);
+const ERROR_COLOR: Color = Color::srgb(0.78, 0.24, 0.2);
+const VIGNETTE_COLOR: Color = Color::srgba(0.0, 0.0, 0.0, 0.58);
+const FOG_COLOR: Color = Color::srgba(0.08, 0.09, 0.11, 0.35);
 
 pub struct MenuPlugin;
 
 impl Plugin for MenuPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MenuSelection>()
+            .init_resource::<SettingsSelection>()
             .init_resource::<MenuError>()
             .init_resource::<JoinAddress>()
             .add_systems(OnEnter(GameState::Menu), spawn_menu)
@@ -68,6 +116,12 @@ impl Plugin for MenuPlugin {
                 (menu_navigate, menu_highlight, update_menu_error)
                     .run_if(in_state(GameState::Menu)),
             )
+            .add_systems(OnEnter(GameState::Settings), spawn_settings)
+            .add_systems(OnExit(GameState::Settings), despawn_settings)
+            .add_systems(
+                Update,
+                (settings_input, settings_refresh).run_if(in_state(GameState::Settings)),
+            )
             .add_systems(OnEnter(GameState::JoinPrompt), spawn_join_prompt)
             .add_systems(OnExit(GameState::JoinPrompt), despawn_join_prompt)
             .add_systems(
@@ -75,6 +129,153 @@ impl Plugin for MenuPlugin {
                 join_prompt_input.run_if(in_state(GameState::JoinPrompt)),
             );
     }
+}
+
+fn spawn_background(parent: &mut ChildBuilder) {
+    parent.spawn(NodeBundle {
+        style: Style {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            right: Val::Px(0.0),
+            top: Val::Px(0.0),
+            bottom: Val::Px(0.0),
+            ..default()
+        },
+        background_color: BackgroundColor(FOG_COLOR),
+        ..default()
+    });
+
+    for (left, top) in [
+        (Val::Px(0.0), Val::Px(0.0)),
+        (Val::Auto, Val::Px(0.0)),
+        (Val::Px(0.0), Val::Auto),
+        (Val::Auto, Val::Auto),
+    ] {
+        let right = if matches!(left, Val::Auto) {
+            Val::Px(0.0)
+        } else {
+            Val::Auto
+        };
+        let bottom = if matches!(top, Val::Auto) {
+            Val::Px(0.0)
+        } else {
+            Val::Auto
+        };
+        parent.spawn(NodeBundle {
+            style: Style {
+                position_type: PositionType::Absolute,
+                left,
+                top,
+                right,
+                bottom,
+                width: Val::Px(360.0),
+                height: Val::Px(260.0),
+                ..default()
+            },
+            background_color: BackgroundColor(VIGNETTE_COLOR),
+            ..default()
+        });
+    }
+
+    parent.spawn(NodeBundle {
+        style: Style {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            right: Val::Px(0.0),
+            top: Val::Px(0.0),
+            height: Val::Px(2.0),
+            ..default()
+        },
+        background_color: BackgroundColor(ACCENT_DIM),
+        ..default()
+    });
+    parent.spawn(NodeBundle {
+        style: Style {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            right: Val::Px(0.0),
+            bottom: Val::Px(0.0),
+            height: Val::Px(2.0),
+            ..default()
+        },
+        background_color: BackgroundColor(ACCENT_DIM),
+        ..default()
+    });
+    parent.spawn(NodeBundle {
+        style: Style {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            top: Val::Px(0.0),
+            bottom: Val::Px(0.0),
+            width: Val::Px(2.0),
+            ..default()
+        },
+        background_color: BackgroundColor(PANEL_BORDER_DARK),
+        ..default()
+    });
+    parent.spawn(NodeBundle {
+        style: Style {
+            position_type: PositionType::Absolute,
+            right: Val::Px(0.0),
+            top: Val::Px(0.0),
+            bottom: Val::Px(0.0),
+            width: Val::Px(2.0),
+            ..default()
+        },
+        background_color: BackgroundColor(PANEL_BORDER_DARK),
+        ..default()
+    });
+}
+
+fn spawn_title_block(parent: &mut ChildBuilder, font: &Handle<Font>, title: &str) {
+    parent
+        .spawn(NodeBundle {
+            style: Style {
+                position_type: PositionType::Relative,
+                margin: UiRect::bottom(Val::Px(4.0)),
+                ..default()
+            },
+            ..default()
+        })
+        .with_children(|stack| {
+            stack.spawn(
+                TextBundle::from_section(
+                    title,
+                    TextStyle {
+                        font: font.clone(),
+                        font_size: 72.0,
+                        color: TITLE_SHADOW,
+                    },
+                )
+                .with_style(Style {
+                    position_type: PositionType::Absolute,
+                    left: Val::Px(4.0),
+                    top: Val::Px(4.0),
+                    ..default()
+                }),
+            );
+            stack.spawn(TextBundle::from_section(
+                title,
+                TextStyle {
+                    font: font.clone(),
+                    font_size: 72.0,
+                    color: ACCENT,
+                },
+            ));
+        });
+}
+
+fn spawn_divider(parent: &mut ChildBuilder) {
+    parent.spawn(NodeBundle {
+        style: Style {
+            width: Val::Px(360.0),
+            height: Val::Px(1.0),
+            margin: UiRect::vertical(Val::Px(14.0)),
+            ..default()
+        },
+        background_color: BackgroundColor(Color::srgba(0.25, 0.28, 0.32, 0.65)),
+        ..default()
+    });
 }
 
 fn spawn_menu(
@@ -92,80 +293,94 @@ fn spawn_menu(
                     height: Val::Percent(100.0),
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(18.0),
                     ..default()
                 },
-                background_color: BackgroundColor(Color::srgb(0.05, 0.06, 0.08)),
+                background_color: BackgroundColor(BG_COLOR),
                 ..default()
             },
             MenuRoot,
         ))
-        .with_children(|parent| {
-            parent.spawn(TextBundle::from_section(
-                "ZOMBIAKI",
-                TextStyle {
-                    font: font.clone(),
-                    font_size: 80.0,
-                    color: Color::srgb(0.85, 0.15, 0.15),
+        .with_children(|root| {
+            spawn_background(root);
+            root.spawn(NodeBundle {
+                style: Style {
+                    width: Val::Px(560.0),
+                    padding: UiRect::all(Val::Px(36.0)),
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    row_gap: Val::Px(10.0),
+                    border: UiRect::all(Val::Px(3.0)),
+                    ..default()
                 },
-            ));
-            parent.spawn(
-                TextBundle::from_section(
-                    "FALE  PRZETRWANIA",
+                background_color: BackgroundColor(PANEL_COLOR),
+                border_color: BorderColor(PANEL_BORDER),
+                ..default()
+            })
+            .with_children(|panel| {
+                spawn_title_block(panel, &font, "ZOMBIES");
+                panel.spawn(TextBundle::from_section(
+                    "WAVES  OF  SURVIVAL",
                     TextStyle {
                         font: font.clone(),
-                        font_size: 20.0,
-                        color: Color::srgb(0.6, 0.6, 0.55),
+                        font_size: 18.0,
+                        color: TEXT_SUBTITLE,
                     },
-                )
-                .with_style(Style {
-                    margin: UiRect::bottom(Val::Px(34.0)),
-                    ..default()
-                }),
-            );
-            for (i, label) in ITEMS.iter().enumerate() {
-                parent.spawn((
+                ));
+                spawn_divider(panel);
+                panel
+                    .spawn(NodeBundle {
+                        style: Style {
+                            flex_direction: FlexDirection::Column,
+                            align_items: AlignItems::Center,
+                            row_gap: Val::Px(12.0),
+                            margin: UiRect::vertical(Val::Px(8.0)),
+                            ..default()
+                        },
+                        ..default()
+                    })
+                    .with_children(|list| {
+                        for (i, label) in ITEMS.iter().enumerate() {
+                            list.spawn((
+                                TextBundle::from_section(
+                                    *label,
+                                    TextStyle {
+                                        font: font.clone(),
+                                        font_size: 24.0,
+                                        color: TEXT_NORMAL,
+                                    },
+                                ),
+                                MenuItem { index: i },
+                            ));
+                        }
+                    });
+                spawn_divider(panel);
+                panel.spawn((
                     TextBundle::from_section(
-                        *label,
+                        "",
                         TextStyle {
                             font: font.clone(),
-                            font_size: 24.0,
-                            color: Color::srgb(0.7, 0.7, 0.7),
+                            font_size: 12.0,
+                            color: ERROR_COLOR,
                         },
                     ),
-                    MenuItem { index: i },
+                    MenuErrorText,
                 ));
-            }
-            parent.spawn((
-                TextBundle::from_section(
-                    "",
-                    TextStyle {
-                        font: font.clone(),
-                        font_size: 12.0,
-                        color: Color::srgb(0.9, 0.35, 0.35),
-                    },
-                )
-                .with_style(Style {
-                    margin: UiRect::top(Val::Px(18.0)),
-                    ..default()
-                }),
-                MenuErrorText,
-            ));
-            parent.spawn(
-                TextBundle::from_section(
-                    "Strzalki - wybor   ENTER - zatwierdz",
-                    TextStyle {
-                        font,
-                        font_size: 11.0,
-                        color: Color::srgb(0.45, 0.45, 0.45),
-                    },
-                )
-                .with_style(Style {
-                    margin: UiRect::top(Val::Px(28.0)),
-                    ..default()
-                }),
-            );
+                panel.spawn(
+                    TextBundle::from_section(
+                        "ARROWS - SELECT     ENTER - CONFIRM",
+                        TextStyle {
+                            font,
+                            font_size: 11.0,
+                            color: TEXT_DIM,
+                        },
+                    )
+                    .with_style(Style {
+                        margin: UiRect::top(Val::Px(8.0)),
+                        ..default()
+                    }),
+                );
+            });
         });
 }
 
@@ -179,20 +394,23 @@ fn menu_navigate(
     keys: Res<ButtonInput<KeyCode>>,
     mut selection: ResMut<MenuSelection>,
     mut next_state: ResMut<NextState<GameState>>,
-    mut exit: EventWriter<AppExit>,
     mut ctx: ResMut<NetContext>,
     mut net_mode: ResMut<NetMode>,
     mut error: ResMut<MenuError>,
+    mut sfx: EventWriter<SfxEvent>,
 ) {
     let up = keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW);
     let down = keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS);
     if up {
         selection.0 = (selection.0 + ITEMS.len() - 1) % ITEMS.len();
+        sfx.send(SfxEvent::MenuMove);
     }
     if down {
         selection.0 = (selection.0 + 1) % ITEMS.len();
+        sfx.send(SfxEvent::MenuMove);
     }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
+        sfx.send(SfxEvent::MenuSelect);
         match selection.0 {
             0 => {
                 ctx.disconnect();
@@ -220,13 +438,19 @@ fn menu_navigate(
                 next_state.set(GameState::JoinPrompt);
             }
             3 => {
-                exit.send(AppExit::Success);
+                error.0.clear();
+                next_state.set(GameState::Settings);
+            }
+            4 => {
+                ctx.disconnect();
+                std::process::exit(0);
             }
             _ => {}
         }
     }
     if keys.just_pressed(KeyCode::Escape) {
-        exit.send(AppExit::Success);
+        ctx.disconnect();
+        std::process::exit(0);
     }
 }
 
@@ -236,14 +460,13 @@ fn menu_highlight(selection: Res<MenuSelection>, mut items: Query<(&MenuItem, &m
     }
     for (item, mut text) in &mut items {
         let selected = item.index == selection.0;
-        let prefix = if selected { "> " } else { "  " };
         let label = ITEMS[item.index];
-        text.sections[0].value = format!("{prefix}{label}");
-        text.sections[0].style.color = if selected {
-            Color::srgb(1.0, 0.85, 0.3)
+        text.sections[0].value = if selected {
+            format!(">  {label}  <")
         } else {
-            Color::srgb(0.6, 0.6, 0.6)
+            format!("   {label}   ")
         };
+        text.sections[0].style.color = if selected { TEXT_HIGHLIGHT } else { TEXT_NORMAL };
     }
 }
 
@@ -253,6 +476,242 @@ fn update_menu_error(error: Res<MenuError>, mut q: Query<&mut Text, With<MenuErr
     }
     if let Ok(mut text) = q.get_single_mut() {
         text.sections[0].value = error.0.clone();
+    }
+}
+
+fn spawn_settings(
+    mut commands: Commands,
+    mut selection: ResMut<SettingsSelection>,
+    assets: Res<UiAssets>,
+    settings: Res<GraphicsSettings>,
+) {
+    selection.0 = 0;
+    let font = assets.font.clone();
+    commands
+        .spawn((
+            NodeBundle {
+                style: Style {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                background_color: BackgroundColor(BG_COLOR),
+                ..default()
+            },
+            SettingsRoot,
+        ))
+        .with_children(|root| {
+            spawn_background(root);
+            root.spawn(NodeBundle {
+                style: Style {
+                    width: Val::Px(620.0),
+                    padding: UiRect::all(Val::Px(36.0)),
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    row_gap: Val::Px(10.0),
+                    border: UiRect::all(Val::Px(3.0)),
+                    ..default()
+                },
+                background_color: BackgroundColor(PANEL_COLOR),
+                border_color: BorderColor(PANEL_BORDER),
+                ..default()
+            })
+            .with_children(|panel| {
+                spawn_title_block(panel, &font, "SETTINGS");
+                panel.spawn(TextBundle::from_section(
+                    "GRAPHICS",
+                    TextStyle {
+                        font: font.clone(),
+                        font_size: 16.0,
+                        color: TEXT_SUBTITLE,
+                    },
+                ));
+                spawn_divider(panel);
+                panel
+                    .spawn(NodeBundle {
+                        style: Style {
+                            width: Val::Percent(100.0),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(12.0),
+                            margin: UiRect::vertical(Val::Px(6.0)),
+                            ..default()
+                        },
+                        ..default()
+                    })
+                    .with_children(|list| {
+                        for i in 0..SETTINGS_ROW_COUNT {
+                            spawn_settings_row(list, &font, i, &settings);
+                        }
+                    });
+                spawn_divider(panel);
+                panel.spawn(
+                    TextBundle::from_section(
+                        "ARROWS - CHANGE     ESC - BACK",
+                        TextStyle {
+                            font,
+                            font_size: 11.0,
+                            color: TEXT_DIM,
+                        },
+                    )
+                    .with_style(Style {
+                        margin: UiRect::top(Val::Px(8.0)),
+                        ..default()
+                    }),
+                );
+            });
+        });
+}
+
+fn spawn_settings_row(
+    list: &mut ChildBuilder,
+    font: &Handle<Font>,
+    index: usize,
+    settings: &GraphicsSettings,
+) {
+    list.spawn((
+        NodeBundle {
+            style: Style {
+                width: Val::Percent(100.0),
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                padding: UiRect::horizontal(Val::Px(28.0)),
+                ..default()
+            },
+            ..default()
+        },
+        SettingsRow { index },
+    ))
+    .with_children(|row| {
+        row.spawn(TextBundle::from_section(
+            SETTINGS_LABELS[index],
+            TextStyle {
+                font: font.clone(),
+                font_size: 18.0,
+                color: TEXT_NORMAL,
+            },
+        ));
+        let value = settings_value_text(settings, index);
+        row.spawn((
+            TextBundle::from_section(
+                value,
+                TextStyle {
+                    font: font.clone(),
+                    font_size: 18.0,
+                    color: TEXT_NORMAL,
+                },
+            ),
+            SettingsValueText { index },
+        ));
+    });
+}
+
+fn settings_value_text(settings: &GraphicsSettings, index: usize) -> String {
+    match index {
+        0 => settings.resolution_label(),
+        1 => settings.window_mode_label().to_string(),
+        2 => settings.vsync_label().to_string(),
+        3 => settings.fps_cap_label(),
+        4 => String::new(),
+        _ => String::new(),
+    }
+}
+
+fn despawn_settings(mut commands: Commands, q: Query<Entity, With<SettingsRoot>>) {
+    for e in &q {
+        commands.entity(e).despawn_recursive();
+    }
+}
+
+fn settings_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut selection: ResMut<SettingsSelection>,
+    mut settings: ResMut<GraphicsSettings>,
+    mut next_state: ResMut<NextState<GameState>>,
+    mut sfx: EventWriter<SfxEvent>,
+) {
+    let up = keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW);
+    let down = keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS);
+    let left = keys.just_pressed(KeyCode::ArrowLeft) || keys.just_pressed(KeyCode::KeyA);
+    let right = keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::KeyD);
+
+    if up {
+        selection.0 = (selection.0 + SETTINGS_ROW_COUNT - 1) % SETTINGS_ROW_COUNT;
+        sfx.send(SfxEvent::MenuMove);
+    }
+    if down {
+        selection.0 = (selection.0 + 1) % SETTINGS_ROW_COUNT;
+        sfx.send(SfxEvent::MenuMove);
+    }
+
+    if left || right {
+        let forward = right;
+        match selection.0 {
+            0 => settings.cycle_resolution(forward),
+            1 => settings.cycle_window_mode(forward),
+            2 => settings.toggle_vsync(),
+            3 => settings.cycle_fps_cap(forward),
+            _ => {}
+        }
+        if selection.0 != 4 {
+            sfx.send(SfxEvent::MenuMove);
+        }
+    }
+
+    if keys.just_pressed(KeyCode::Enter) && selection.0 == 4 {
+        sfx.send(SfxEvent::MenuCancel);
+        next_state.set(GameState::Menu);
+        return;
+    }
+    if keys.just_pressed(KeyCode::Escape) {
+        sfx.send(SfxEvent::MenuCancel);
+        next_state.set(GameState::Menu);
+    }
+}
+
+fn settings_refresh(
+    selection: Res<SettingsSelection>,
+    settings: Res<GraphicsSettings>,
+    mut rows: Query<(&SettingsRow, &Children)>,
+    mut values: Query<(&SettingsValueText, &mut Text), Without<SettingsRow>>,
+    mut labels: Query<&mut Text, (Without<SettingsValueText>, Without<SettingsRow>)>,
+) {
+    let selection_changed = selection.is_changed() || selection.is_added();
+    let settings_changed = settings.is_changed() || settings.is_added();
+    if !selection_changed && !settings_changed {
+        return;
+    }
+
+    for (value_marker, mut text) in &mut values {
+        let idx = value_marker.index;
+        text.sections[0].value = settings_value_text(&settings, idx);
+        let selected = idx == selection.0;
+        text.sections[0].style.color = if selected {
+            TEXT_HIGHLIGHT
+        } else {
+            TEXT_NORMAL
+        };
+    }
+
+    for (row, children) in &mut rows {
+        let selected = row.index == selection.0;
+        for child in children.iter() {
+            let Ok(mut text) = labels.get_mut(*child) else {
+                continue;
+            };
+            let raw_label = SETTINGS_LABELS[row.index];
+            text.sections[0].value = if selected {
+                format!("> {raw_label}")
+            } else {
+                format!("  {raw_label}")
+            };
+            text.sections[0].style.color = if selected {
+                TEXT_HIGHLIGHT
+            } else {
+                TEXT_NORMAL
+            };
+        }
     }
 }
 
@@ -266,82 +725,84 @@ fn spawn_join_prompt(mut commands: Commands, assets: Res<UiAssets>, addr: Res<Jo
                     height: Val::Percent(100.0),
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(20.0),
                     ..default()
                 },
-                background_color: BackgroundColor(Color::srgb(0.05, 0.06, 0.08)),
+                background_color: BackgroundColor(BG_COLOR),
                 ..default()
             },
             JoinPromptRoot,
         ))
-        .with_children(|parent| {
-            parent.spawn(TextBundle::from_section(
-                "DOLACZ LAN",
-                TextStyle {
-                    font: font.clone(),
-                    font_size: 48.0,
-                    color: Color::srgb(0.85, 0.15, 0.15),
+        .with_children(|root| {
+            spawn_background(root);
+            root.spawn(NodeBundle {
+                style: Style {
+                    width: Val::Px(560.0),
+                    padding: UiRect::all(Val::Px(36.0)),
+                    flex_direction: FlexDirection::Column,
+                    align_items: AlignItems::Center,
+                    row_gap: Val::Px(12.0),
+                    border: UiRect::all(Val::Px(3.0)),
+                    ..default()
                 },
-            ));
-            parent.spawn(
-                TextBundle::from_section(
-                    "Wpisz IP hosta (cyfry i kropki):",
+                background_color: BackgroundColor(PANEL_COLOR),
+                border_color: BorderColor(PANEL_BORDER),
+                ..default()
+            })
+            .with_children(|panel| {
+                spawn_title_block(panel, &font, "JOIN");
+                panel.spawn(TextBundle::from_section(
+                    "LAN MODE",
                     TextStyle {
                         font: font.clone(),
-                        font_size: 14.0,
-                        color: Color::srgb(0.7, 0.7, 0.7),
+                        font_size: 16.0,
+                        color: TEXT_SUBTITLE,
                     },
-                )
-                .with_style(Style {
-                    margin: UiRect::top(Val::Px(14.0)),
-                    ..default()
-                }),
-            );
-            parent.spawn((
-                TextBundle::from_section(
-                    format!("IP: {}_", addr.text),
+                ));
+                spawn_divider(panel);
+                panel.spawn(TextBundle::from_section(
+                    "ENTER HOST IP (DIGITS AND DOTS):",
                     TextStyle {
                         font: font.clone(),
-                        font_size: 28.0,
-                        color: Color::srgb(1.0, 0.85, 0.3),
+                        font_size: 13.0,
+                        color: TEXT_DIM,
                     },
-                )
-                .with_style(Style {
-                    margin: UiRect::top(Val::Px(8.0)),
-                    ..default()
-                }),
-                JoinPromptIpText,
-            ));
-            parent.spawn((
-                TextBundle::from_section(
-                    "",
-                    TextStyle {
-                        font: font.clone(),
-                        font_size: 12.0,
-                        color: Color::srgb(0.9, 0.35, 0.35),
-                    },
-                )
-                .with_style(Style {
-                    margin: UiRect::top(Val::Px(10.0)),
-                    ..default()
-                }),
-                JoinPromptErrorText,
-            ));
-            parent.spawn(
-                TextBundle::from_section(
-                    "ENTER - polacz   BACKSPACE - usun   ESC - wroc",
+                ));
+                panel.spawn((
+                    TextBundle::from_section(
+                        format!("IP: {}_", addr.text),
+                        TextStyle {
+                            font: font.clone(),
+                            font_size: 26.0,
+                            color: TEXT_HIGHLIGHT,
+                        },
+                    )
+                    .with_style(Style {
+                        margin: UiRect::vertical(Val::Px(8.0)),
+                        ..default()
+                    }),
+                    JoinPromptIpText,
+                ));
+                panel.spawn((
+                    TextBundle::from_section(
+                        "",
+                        TextStyle {
+                            font: font.clone(),
+                            font_size: 12.0,
+                            color: ERROR_COLOR,
+                        },
+                    ),
+                    JoinPromptErrorText,
+                ));
+                spawn_divider(panel);
+                panel.spawn(TextBundle::from_section(
+                    "ENTER - CONNECT   BACKSPACE - DELETE   ESC - BACK",
                     TextStyle {
                         font,
                         font_size: 10.0,
-                        color: Color::srgb(0.5, 0.5, 0.5),
+                        color: TEXT_DIM,
                     },
-                )
-                .with_style(Style {
-                    margin: UiRect::top(Val::Px(40.0)),
-                    ..default()
-                }),
-            );
+                ));
+            });
         });
 }
 
@@ -382,6 +843,7 @@ fn join_prompt_input(
         &mut Text,
         (With<JoinPromptErrorText>, Without<JoinPromptIpText>),
     >,
+    mut sfx: EventWriter<SfxEvent>,
 ) {
     let mut changed = false;
     for key in keys.get_just_pressed() {
@@ -389,15 +851,18 @@ fn join_prompt_input(
             if addr.text.len() < 21 {
                 addr.text.push(d);
                 changed = true;
+                sfx.send(SfxEvent::MenuMove);
             }
         } else if matches!(key, KeyCode::Period | KeyCode::NumpadDecimal) {
             if addr.text.len() < 21 {
                 addr.text.push('.');
                 changed = true;
+                sfx.send(SfxEvent::MenuMove);
             }
         } else if *key == KeyCode::Backspace {
             addr.text.pop();
             changed = true;
+            sfx.send(SfxEvent::MenuMove);
         }
     }
     if changed {
@@ -406,10 +871,12 @@ fn join_prompt_input(
         }
     }
     if keys.just_pressed(KeyCode::Escape) {
+        sfx.send(SfxEvent::MenuCancel);
         next_state.set(GameState::Menu);
         return;
     }
     if keys.just_pressed(KeyCode::Enter) {
+        sfx.send(SfxEvent::MenuSelect);
         let parse: Result<IpAddr, _> = addr.text.parse();
         match parse {
             Ok(ip) => {
@@ -423,7 +890,7 @@ fn join_prompt_input(
                         next_state.set(GameState::Lobby);
                     }
                     Err(e) => {
-                        addr.error = format!("Blad: {e}");
+                        addr.error = format!("Error: {e}");
                         if let Ok(mut t) = err_text.get_single_mut() {
                             t.sections[0].value = addr.error.clone();
                         }
@@ -431,7 +898,7 @@ fn join_prompt_input(
                 }
             }
             Err(_) => {
-                addr.error = "Niepoprawny IP".to_string();
+                addr.error = "Invalid IP".to_string();
                 if let Ok(mut t) = err_text.get_single_mut() {
                     t.sections[0].value = addr.error.clone();
                 }

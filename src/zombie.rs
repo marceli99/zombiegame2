@@ -1,7 +1,10 @@
 use bevy::prelude::*;
 use rand::Rng;
 
-use crate::map::{MapObstacles, MAP_HEIGHT, MAP_WIDTH};
+use crate::map::{
+    bfs_distance_field, in_bounds, nav_idx, tile_center, world_to_tile, MapObstacles, NavGrid,
+    MAP_HEIGHT, MAP_WIDTH,
+};
 use crate::net::{is_authoritative, NetContext, NetId};
 use crate::pixelart::{Canvas, Rgba};
 use crate::player::{Player, PlayerDamagedEvent, PLAYER_RADIUS};
@@ -43,7 +46,12 @@ impl Plugin for ZombiePlugin {
             .add_systems(OnExit(GameState::Playing), despawn_all_zombies)
             .add_systems(
                 FixedUpdate,
-                (spawn_zombie_listener, zombie_movement, zombie_attack)
+                (
+                    spawn_zombie_listener,
+                    update_nav_flow,
+                    zombie_movement,
+                    zombie_attack,
+                )
                     .chain()
                     .run_if(gameplay_active)
                     .run_if(is_authoritative),
@@ -159,19 +167,129 @@ fn spawn_zombie_listener(
     }
 }
 
+fn update_nav_flow(mut nav: ResMut<NavGrid>, players: Query<(&Transform, &Player)>) {
+    nav.player_flow.clear();
+    let walkable = nav.walkable.clone();
+    for (t, p) in &players {
+        if p.hp <= 0 {
+            continue;
+        }
+        let field = bfs_distance_field(&walkable, t.translation.truncate());
+        nav.player_flow.insert(p.id, field);
+    }
+}
+
+fn zombie_flow_direction(nav: &NavGrid, zombie_pos: Vec2, player_pos: Vec2) -> Option<Vec2> {
+    let flow = nav.player_flow.values().min_by_key(|field| {
+        let (c, r) = world_to_tile(zombie_pos);
+        if !in_bounds(c, r) {
+            return u16::MAX;
+        }
+        field[nav_idx(c, r)]
+    })?;
+    let (zc, zr) = world_to_tile(zombie_pos);
+    if !in_bounds(zc, zr) {
+        return None;
+    }
+    let my_d = flow[nav_idx(zc, zr)];
+    if my_d == u16::MAX {
+        return None;
+    }
+    if my_d == 0 {
+        return Some((player_pos - zombie_pos).normalize_or_zero());
+    }
+    let dirs: [(i32, i32); 8] = [
+        (-1, 0), (1, 0), (0, -1), (0, 1),
+        (-1, -1), (-1, 1), (1, -1), (1, 1),
+    ];
+    let mut best: Option<(u16, (i32, i32))> = None;
+    for &(dc, dr) in &dirs {
+        let (nc, nr) = (zc + dc, zr + dr);
+        if !in_bounds(nc, nr) {
+            continue;
+        }
+        let d = flow[nav_idx(nc, nr)];
+        if d == u16::MAX {
+            continue;
+        }
+        if dc != 0 && dr != 0 {
+            let idx_a = nav_idx(zc + dc, zr);
+            let idx_b = nav_idx(zc, zr + dr);
+            if flow[idx_a] == u16::MAX || flow[idx_b] == u16::MAX {
+                continue;
+            }
+        }
+        if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+            best = Some((d, (nc, nr)));
+        }
+    }
+    let (_, (nc, nr)) = best?;
+    let target = tile_center(nc, nr);
+    Some((target - zombie_pos).normalize_or_zero())
+}
+
+fn rotate_vec(v: Vec2, angle: f32) -> Vec2 {
+    let (s, c) = angle.sin_cos();
+    Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
+}
+
+fn steer_around_obstacles(
+    pos: Vec2,
+    desired: Vec2,
+    obstacles: &MapObstacles,
+) -> Vec2 {
+    if desired == Vec2::ZERO {
+        return desired;
+    }
+    let look = ZOMBIE_RADIUS + 10.0;
+    if !obstacles.hits(pos + desired * look, ZOMBIE_RADIUS) {
+        return desired;
+    }
+    const OFFSETS: [f32; 6] = [
+        std::f32::consts::FRAC_PI_6,
+        -std::f32::consts::FRAC_PI_6,
+        std::f32::consts::FRAC_PI_4,
+        -std::f32::consts::FRAC_PI_4,
+        std::f32::consts::FRAC_PI_2,
+        -std::f32::consts::FRAC_PI_2,
+    ];
+    for &ang in &OFFSETS {
+        let alt = rotate_vec(desired, ang);
+        if !obstacles.hits(pos + alt * look, ZOMBIE_RADIUS) {
+            return alt;
+        }
+    }
+    let back_offsets: [f32; 2] = [
+        std::f32::consts::PI * 0.75,
+        -std::f32::consts::PI * 0.75,
+    ];
+    for &ang in &back_offsets {
+        let alt = rotate_vec(desired, ang);
+        if !obstacles.hits(pos + alt * look, ZOMBIE_RADIUS) {
+            return alt;
+        }
+    }
+    desired
+}
+
 fn zombie_movement(
     time: Res<Time>,
     obstacles: Res<MapObstacles>,
+    nav: Res<NavGrid>,
     mut zombies: Query<(&mut Transform, &Zombie), Without<Player>>,
-    players: Query<&Transform, With<Player>>,
+    players: Query<(&Transform, &Player)>,
 ) {
     let dt = time.delta_seconds();
     for (mut transform, zombie) in &mut zombies {
         let pos = transform.translation.truncate();
+
         let mut nearest: Option<Vec2> = None;
         let mut best_d2 = f32::INFINITY;
-        for p in &players {
-            let pp = p.translation.truncate();
+        for (pt, p) in &players {
+            if p.hp <= 0 {
+                continue;
+            }
+            let pp = pt.translation.truncate();
             let d2 = pp.distance_squared(pos);
             if d2 < best_d2 {
                 best_d2 = d2;
@@ -181,7 +299,11 @@ fn zombie_movement(
         let Some(target) = nearest else {
             continue;
         };
-        let dir = (target - pos).normalize_or_zero();
+
+        let flow = zombie_flow_direction(&nav, pos, target)
+            .unwrap_or_else(|| (target - pos).normalize_or_zero());
+        let dir = steer_around_obstacles(pos, flow, &obstacles);
+
         if dir != Vec2::ZERO {
             transform.rotation = Quat::from_rotation_z(dir.y.atan2(dir.x));
         }

@@ -54,7 +54,7 @@ fn spawn_lobby(mut commands: Commands, assets: Res<UiAssets>, net: Res<NetMode>)
         .with_children(|parent| {
             let title = match *net {
                 NetMode::Host => "LOBBY - HOST",
-                NetMode::Client => "LOBBY - GRACZ",
+                NetMode::Client => "LOBBY - CLIENT",
                 _ => "LOBBY",
             };
             parent.spawn(TextBundle::from_section(
@@ -67,7 +67,7 @@ fn spawn_lobby(mut commands: Commands, assets: Res<UiAssets>, net: Res<NetMode>)
             ));
             parent.spawn((
                 TextBundle::from_section(
-                    "GRACZE: 1/4",
+                    "PLAYERS: 1/4",
                     TextStyle {
                         font: font.clone(),
                         font_size: 22.0,
@@ -97,7 +97,7 @@ fn spawn_lobby(mut commands: Commands, assets: Res<UiAssets>, net: Res<NetMode>)
             ));
             parent.spawn(
                 TextBundle::from_section(
-                    "ESC - powrot do menu",
+                    "ESC - back to menu",
                     TextStyle {
                         font,
                         font_size: 11.0,
@@ -230,12 +230,12 @@ fn update_lobby_ui(
 ) {
     if let Ok(mut text) = list.get_single_mut() {
         let count = ctx.lobby_players.len();
-        text.sections[0].value = format!("GRACZE: {count}/4");
+        text.sections[0].value = format!("PLAYERS: {count}/4");
     }
     if let Ok(mut text) = status.get_single_mut() {
         text.sections[0].value = match *net {
-            NetMode::Host => "ENTER - rozpocznij gre".to_string(),
-            NetMode::Client => "CZEKANIE NA HOSTA...".to_string(),
+            NetMode::Host => "ENTER - start game".to_string(),
+            NetMode::Client => "WAITING FOR HOST...".to_string(),
             _ => String::new(),
         };
     }

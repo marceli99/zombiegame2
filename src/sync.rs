@@ -4,11 +4,12 @@ use std::collections::HashSet;
 use crate::bullet::{spawn_bullet_entity, Bullet, BulletAssets};
 use crate::net::{
     broadcast, is_host, is_net_client, ClientInEvent, ClientMsg, LocalInput, NetBulletState,
-    NetContext, NetEntities, NetMode, NetPlayerState, NetSnapshot, NetZombieState, RemoteInputs,
-    ServerEvent, ServerMsg,
+    NetContext, NetEntities, NetMode, NetPickupState, NetPlayerState, NetSnapshot, NetZombieState,
+    RemoteInputs, ServerEvent, ServerMsg,
 };
 use crate::player::{spawn_player_entity, Player, PlayerAssets};
 use crate::wave::WaveState;
+use crate::weapon::{spawn_pickup_entity, Weapon, WeaponAssets, WeaponPickup};
 use crate::zombie::{spawn_zombie_entity, Zombie, ZombieAssets, ZOMBIE_BASE_SPEED, ZOMBIE_HP};
 use crate::{GameState, Score};
 
@@ -66,6 +67,7 @@ fn server_broadcast_snapshot(
     players: Query<(&Transform, &Player)>,
     zombies: Query<(&Transform, &crate::net::NetId), With<Zombie>>,
     bullets: Query<(&Transform, &crate::net::NetId), With<Bullet>>,
+    pickups: Query<(&Transform, &crate::net::NetId, &WeaponPickup)>,
     score: Res<Score>,
     wave: Res<WaveState>,
     game_state: Res<State<GameState>>,
@@ -84,6 +86,7 @@ fn server_broadcast_snapshot(
             y: t.translation.y,
             rot: t.rotation.to_euler(EulerRot::ZYX).0,
             hp: p.hp,
+            weapon: p.weapon.as_u8(),
         })
         .collect();
 
@@ -107,11 +110,22 @@ fn server_broadcast_snapshot(
         })
         .collect();
 
+    let pickup_states: Vec<NetPickupState> = pickups
+        .iter()
+        .map(|(t, id, pk)| NetPickupState {
+            id: id.0,
+            x: t.translation.x,
+            y: t.translation.y,
+            kind: pk.kind.as_u8(),
+        })
+        .collect();
+
     let snap = NetSnapshot {
         tick: *tick,
         players: player_states,
         zombies: zombie_states,
         bullets: bullet_states,
+        pickups: pickup_states,
         score: score.0,
         wave: wave.current_wave,
         in_break: wave.in_break,
@@ -138,6 +152,7 @@ fn client_apply_snapshots(
     player_assets: Res<PlayerAssets>,
     zombie_assets: Res<ZombieAssets>,
     bullet_assets: Res<BulletAssets>,
+    weapon_assets: Res<WeaponAssets>,
     mut players: Query<
         (&mut Transform, &mut Player),
         (Without<Zombie>, Without<Bullet>),
@@ -207,6 +222,7 @@ fn client_apply_snapshots(
                     t.translation.y = np.y;
                     t.rotation = Quat::from_rotation_z(np.rot);
                     p.hp = np.hp;
+                    p.weapon = Weapon::from_u8(np.weapon);
                 }
             }
             None => {
@@ -285,6 +301,8 @@ fn client_apply_snapshots(
                     &bullet_assets,
                     Vec2::new(nb.x, nb.y),
                     Vec2::new(nb.rot.cos(), nb.rot.sin()),
+                    0.0,
+                    0,
                     nb.id,
                 );
                 net_entities.bullets.insert(nb.id, ent);
@@ -299,6 +317,33 @@ fn client_apply_snapshots(
         .collect();
     for k in stale_bullets {
         if let Some(ent) = net_entities.bullets.remove(&k) {
+            commands.entity(ent).despawn_recursive();
+        }
+    }
+
+    let mut seen_pickups: HashSet<u32> = HashSet::new();
+    for np in &snap.pickups {
+        seen_pickups.insert(np.id);
+        if !net_entities.pickups.contains_key(&np.id) {
+            let kind = Weapon::from_u8(np.kind);
+            let ent = spawn_pickup_entity(
+                &mut commands,
+                &weapon_assets,
+                Vec2::new(np.x, np.y),
+                kind,
+                np.id,
+            );
+            net_entities.pickups.insert(np.id, ent);
+        }
+    }
+    let stale_pickups: Vec<u32> = net_entities
+        .pickups
+        .keys()
+        .filter(|k| !seen_pickups.contains(k))
+        .copied()
+        .collect();
+    for k in stale_pickups {
+        if let Some(ent) = net_entities.pickups.remove(&k) {
             commands.entity(ent).despawn_recursive();
         }
     }

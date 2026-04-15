@@ -7,9 +7,11 @@ mod net;
 mod pause;
 mod pixelart;
 mod player;
+mod settings;
 mod sync;
 mod ui;
 mod wave;
+mod weapon;
 mod zombie;
 
 use bevy::prelude::*;
@@ -23,12 +25,14 @@ use crate::player::Player;
 
 pub const WINDOW_WIDTH: f32 = 1280.0;
 pub const WINDOW_HEIGHT: f32 = 720.0;
+pub const FIXED_VIEW_H: f32 = 760.0;
 pub const TICK_HZ: f64 = 60.0;
 
 #[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GameState {
     #[default]
     Menu,
+    Settings,
     JoinPrompt,
     Lobby,
     Playing,
@@ -70,7 +74,7 @@ fn main() {
         DefaultPlugins
             .set(WindowPlugin {
                 primary_window: Some(Window {
-                    title: "Zombiaki - Fale Przetrwania".into(),
+                    title: "Zombies - Waves of Survival".into(),
                     resolution: (WINDOW_WIDTH, WINDOW_HEIGHT).into(),
                     resizable: true,
                     resize_constraints: WindowResizeConstraints {
@@ -93,10 +97,11 @@ fn main() {
 
     app.init_state::<GameState>()
         .init_state::<PauseState>()
-        .insert_resource(ClearColor(Color::srgb(0.05, 0.06, 0.08)))
+        .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
         .init_resource::<Score>()
         .add_plugins((
+            settings::SettingsPlugin,
             net::NetPlugin,
             sync::NetSyncPlugin,
             map::MapPlugin,
@@ -106,6 +111,7 @@ fn main() {
             player::PlayerPlugin,
             zombie::ZombiePlugin,
             bullet::BulletPlugin,
+            weapon::WeaponPlugin,
             wave::WavePlugin,
             audio::AudioFxPlugin,
             ui::UiPlugin,
@@ -120,7 +126,7 @@ fn main() {
 
 fn setup_camera(mut commands: Commands) {
     let mut camera = Camera2dBundle::default();
-    camera.projection.scaling_mode = ScalingMode::FixedVertical(WINDOW_HEIGHT);
+    camera.projection.scaling_mode = ScalingMode::FixedVertical(FIXED_VIEW_H);
     commands.spawn(camera);
 }
 
@@ -146,7 +152,7 @@ fn camera_follow(
         return;
     };
 
-    let view_h = WINDOW_HEIGHT;
+    let view_h = FIXED_VIEW_H;
     let aspect = if window.height() > 0.0 {
         window.width() / window.height()
     } else {
