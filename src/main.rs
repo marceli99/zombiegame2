@@ -1,3 +1,4 @@
+mod achievements;
 mod audio;
 mod bullet;
 mod lobby;
@@ -13,11 +14,12 @@ mod ui;
 mod wave;
 mod weapon;
 mod zombie;
+mod zones;
 
 use bevy::prelude::*;
 use bevy::render::camera::ScalingMode;
 use bevy::time::Fixed;
-use bevy::window::{PrimaryWindow, WindowResizeConstraints};
+use bevy::window::{PrimaryWindow, WindowMode, WindowResizeConstraints};
 
 use crate::map::{MAP_HEIGHT, MAP_WIDTH};
 use crate::net::{NetContext, NetMode};
@@ -37,6 +39,8 @@ pub enum GameState {
     Lobby,
     Playing,
     GameOver,
+    Achievements,
+    Guide,
 }
 
 #[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
@@ -76,6 +80,7 @@ fn main() {
                 primary_window: Some(Window {
                     title: "Zombies - Waves of Survival".into(),
                     resolution: (WINDOW_WIDTH, WINDOW_HEIGHT).into(),
+                    mode: WindowMode::BorderlessFullscreen,
                     resizable: true,
                     resize_constraints: WindowResizeConstraints {
                         min_width: WINDOW_WIDTH,
@@ -109,10 +114,14 @@ fn main() {
             lobby::LobbyPlugin,
             pause::PausePlugin,
             player::PlayerPlugin,
+        ))
+        .add_plugins((
             zombie::ZombiePlugin,
             bullet::BulletPlugin,
             weapon::WeaponPlugin,
             wave::WavePlugin,
+            zones::ZonesPlugin,
+            achievements::AchievementsPlugin,
             audio::AudioFxPlugin,
             ui::UiPlugin,
         ))
@@ -152,16 +161,15 @@ fn camera_follow(
         return;
     };
 
-    let view_h = FIXED_VIEW_H;
     let aspect = if window.height() > 0.0 {
         window.width() / window.height()
     } else {
         WINDOW_WIDTH / WINDOW_HEIGHT
     };
-    let view_w = view_h * aspect;
+    let view_w = FIXED_VIEW_H * aspect;
 
     let max_x = (MAP_WIDTH / 2.0 - view_w / 2.0).max(0.0);
-    let max_y = (MAP_HEIGHT / 2.0 - view_h / 2.0).max(0.0);
+    let max_y = (MAP_HEIGHT / 2.0 - FIXED_VIEW_H / 2.0).max(0.0);
 
     cam_transform.translation.x = target.x.clamp(-max_x, max_x);
     cam_transform.translation.y = target.y.clamp(-max_y, max_y);

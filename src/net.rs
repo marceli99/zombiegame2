@@ -36,6 +36,9 @@ pub struct NetInput {
     pub aim_x: f32,
     pub aim_y: f32,
     pub shoot: bool,
+    pub throw: bool,
+    pub reload: bool,
+    pub switch_slot: u8,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -45,6 +48,7 @@ pub struct NetSnapshot {
     pub zombies: Vec<NetZombieState>,
     pub bullets: Vec<NetBulletState>,
     pub pickups: Vec<NetPickupState>,
+    pub explosions: Vec<NetExplosionState>,
     pub score: u32,
     pub wave: u32,
     pub in_break: bool,
@@ -69,6 +73,7 @@ pub struct NetZombieState {
     pub x: f32,
     pub y: f32,
     pub rot: f32,
+    pub kind: u8,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -77,6 +82,7 @@ pub struct NetBulletState {
     pub x: f32,
     pub y: f32,
     pub rot: f32,
+    pub is_rocket: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -85,6 +91,15 @@ pub struct NetPickupState {
     pub x: f32,
     pub y: f32,
     pub kind: u8,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct NetExplosionState {
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+    pub remaining: f32,
 }
 
 #[derive(Resource, Default, PartialEq, Eq, Clone, Copy, Debug)]
@@ -136,6 +151,7 @@ pub struct NetContext {
     pub next_zombie_net_id: u32,
     pub next_bullet_net_id: u32,
     pub next_pickup_net_id: u32,
+    pub next_explosion_net_id: u32,
 }
 
 impl NetContext {
@@ -151,10 +167,15 @@ impl NetContext {
         self.next_pickup_net_id = self.next_pickup_net_id.wrapping_add(1);
         self.next_pickup_net_id
     }
+    pub fn alloc_explosion_id(&mut self) -> u32 {
+        self.next_explosion_net_id = self.next_explosion_net_id.wrapping_add(1);
+        self.next_explosion_net_id
+    }
     pub fn reset_alloc(&mut self) {
         self.next_zombie_net_id = 0;
         self.next_bullet_net_id = 0;
         self.next_pickup_net_id = 0;
+        self.next_explosion_net_id = 0;
     }
     pub fn disconnect(&mut self) {
         self.host = None;
@@ -177,6 +198,7 @@ pub struct NetEntities {
     pub zombies: HashMap<u32, Entity>,
     pub bullets: HashMap<u32, Entity>,
     pub pickups: HashMap<u32, Entity>,
+    pub explosions: HashMap<u32, Entity>,
 }
 
 impl NetEntities {
@@ -185,6 +207,7 @@ impl NetEntities {
         self.zombies.clear();
         self.bullets.clear();
         self.pickups.clear();
+        self.explosions.clear();
     }
 }
 
@@ -247,7 +270,7 @@ pub fn start_host() -> std::io::Result<HostConn> {
             }
             let _ = stream.set_nodelay(true);
 
-            let current_count = senders_clone.lock().unwrap().len();
+            let current_count = senders_clone.lock().unwrap_or_else(|e| e.into_inner()).len();
             if current_count >= (MAX_PLAYERS - 1) as usize {
                 let mut s = stream;
                 let _ = write_msg(&mut s, &ServerMsg::FullLobby);
@@ -267,7 +290,7 @@ pub fn start_host() -> std::io::Result<HostConn> {
             }
 
             let (out_tx, out_rx) = channel::<ServerMsg>();
-            senders_clone.lock().unwrap().insert(id, out_tx);
+            senders_clone.lock().unwrap_or_else(|e| e.into_inner()).insert(id, out_tx);
             let _ = event_tx_clone.send(ServerEvent::Connected { id });
 
             let mut writer_stream = match stream.try_clone() {
@@ -298,12 +321,12 @@ pub fn start_host() -> std::io::Result<HostConn> {
                     }
                     Ok(ClientMsg::Hello) => {}
                     Ok(ClientMsg::Leave) => {
-                        reader_senders.lock().unwrap().remove(&id);
+                        reader_senders.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                         let _ = reader_event_tx.send(ServerEvent::Disconnected { id });
                         break;
                     }
                     Err(_) => {
-                        reader_senders.lock().unwrap().remove(&id);
+                        reader_senders.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
                         let _ = reader_event_tx.send(ServerEvent::Disconnected { id });
                         break;
                     }
@@ -387,7 +410,7 @@ pub fn start_client(addr: SocketAddr) -> std::io::Result<ClientConn> {
 }
 
 pub fn broadcast(host: &HostConn, msg: &ServerMsg) {
-    let senders = host.senders.lock().unwrap();
+    let senders = host.senders.lock().unwrap_or_else(|e| e.into_inner());
     for tx in senders.values() {
         let _ = tx.send(msg.clone());
     }

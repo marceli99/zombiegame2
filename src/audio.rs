@@ -10,9 +10,11 @@ pub enum SfxEvent {
     Hit,
     ZombieDeath,
     PlayerHit,
+    Explosion,
     MenuMove,
     MenuSelect,
     MenuCancel,
+    Heal,
 }
 
 #[derive(Component)]
@@ -56,9 +58,11 @@ fn play_sfx(
             SfxEvent::Hit => (520.0, 35, 0.12),
             SfxEvent::ZombieDeath => (160.0, 180, 0.20),
             SfxEvent::PlayerHit => (110.0, 260, 0.30),
+            SfxEvent::Explosion => (70.0, 320, 0.36),
             SfxEvent::MenuMove => (220.0, 35, 0.10),
             SfxEvent::MenuSelect => (146.0, 110, 0.18),
             SfxEvent::MenuCancel => (98.0, 140, 0.15),
+            SfxEvent::Heal => (660.0, 100, 0.18),
         };
         commands.spawn(PitchBundle {
             source: pitches.add(Pitch {
@@ -75,7 +79,7 @@ fn ensure_menu_ambience(
     existing: Query<Entity, With<MenuAmbience>>,
     mut pitches: ResMut<Assets<Pitch>>,
 ) {
-    if existing.iter().next().is_some() {
+    if !existing.is_empty() {
         return;
     }
     let loop_settings = |vol: f32| PlaybackSettings {

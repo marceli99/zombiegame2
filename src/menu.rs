@@ -27,6 +27,9 @@ pub struct JoinPromptIpText;
 pub struct JoinPromptErrorText;
 
 #[derive(Component)]
+pub struct GuideRoot;
+
+#[derive(Component)]
 pub struct SettingsRoot;
 
 #[derive(Component)]
@@ -45,14 +48,8 @@ pub struct MenuSelection(pub usize);
 #[derive(Resource, Default)]
 pub struct SettingsSelection(pub usize);
 
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub struct MenuError(pub String);
-
-impl Default for MenuError {
-    fn default() -> Self {
-        Self(String::new())
-    }
-}
 
 #[derive(Resource)]
 pub struct JoinAddress {
@@ -69,20 +66,24 @@ impl Default for JoinAddress {
     }
 }
 
-const ITEMS: [&str; 5] = [
+const ITEMS: [&str; 7] = [
     "SINGLE PLAYER",
     "HOST LAN",
     "JOIN LAN",
     "SETTINGS",
+    "ACHIEVEMENTS",
+    "HOW TO PLAY",
     "QUIT",
 ];
 
-const SETTINGS_ROW_COUNT: usize = 5;
+const SETTINGS_ROW_COUNT: usize = 7;
 const SETTINGS_LABELS: [&str; SETTINGS_ROW_COUNT] = [
     "RESOLUTION",
     "WINDOW MODE",
     "VSYNC",
     "FPS LIMIT",
+    "QUALITY",
+    "FPS COUNTER",
     "BACK",
 ];
 
@@ -127,6 +128,12 @@ impl Plugin for MenuPlugin {
             .add_systems(
                 Update,
                 join_prompt_input.run_if(in_state(GameState::JoinPrompt)),
+            )
+            .add_systems(OnEnter(GameState::Guide), spawn_guide)
+            .add_systems(OnExit(GameState::Guide), despawn_guide)
+            .add_systems(
+                Update,
+                guide_input.run_if(in_state(GameState::Guide)),
             );
     }
 }
@@ -442,6 +449,14 @@ fn menu_navigate(
                 next_state.set(GameState::Settings);
             }
             4 => {
+                error.0.clear();
+                next_state.set(GameState::Achievements);
+            }
+            5 => {
+                error.0.clear();
+                next_state.set(GameState::Guide);
+            }
+            6 => {
                 ctx.disconnect();
                 std::process::exit(0);
             }
@@ -613,7 +628,9 @@ fn settings_value_text(settings: &GraphicsSettings, index: usize) -> String {
         1 => settings.window_mode_label().to_string(),
         2 => settings.vsync_label().to_string(),
         3 => settings.fps_cap_label(),
-        4 => String::new(),
+        4 => settings.quality_label().to_string(),
+        5 => settings.show_fps_label().to_string(),
+        6 => String::new(),
         _ => String::new(),
     }
 }
@@ -652,14 +669,16 @@ fn settings_input(
             1 => settings.cycle_window_mode(forward),
             2 => settings.toggle_vsync(),
             3 => settings.cycle_fps_cap(forward),
+            4 => settings.cycle_quality(forward),
+            5 => settings.toggle_show_fps(),
             _ => {}
         }
-        if selection.0 != 4 {
+        if selection.0 != 6 {
             sfx.send(SfxEvent::MenuMove);
         }
     }
 
-    if keys.just_pressed(KeyCode::Enter) && selection.0 == 4 {
+    if keys.just_pressed(KeyCode::Enter) && selection.0 == 6 {
         sfx.send(SfxEvent::MenuCancel);
         next_state.set(GameState::Menu);
         return;
@@ -904,5 +923,133 @@ fn join_prompt_input(
                 }
             }
         }
+    }
+}
+
+fn spawn_guide(mut commands: Commands, assets: Res<UiAssets>) {
+    let font = assets.font.clone();
+    let title = TextStyle {
+        font: font.clone(),
+        font_size: 28.0,
+        color: TEXT_HIGHLIGHT,
+    };
+    let heading = TextStyle {
+        font: font.clone(),
+        font_size: 16.0,
+        color: Color::srgb(0.9, 0.75, 0.3),
+    };
+    let body = TextStyle {
+        font: font.clone(),
+        font_size: 12.0,
+        color: TEXT_NORMAL,
+    };
+    let hint = TextStyle {
+        font: font.clone(),
+        font_size: 11.0,
+        color: TEXT_DIM,
+    };
+
+    commands
+        .spawn((
+            NodeBundle {
+                style: Style {
+                    width: Val::Percent(100.0),
+                    height: Val::Percent(100.0),
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                background_color: BackgroundColor(BG_COLOR),
+                ..default()
+            },
+            GuideRoot,
+        ))
+        .with_children(|root| {
+            root.spawn(NodeBundle {
+                style: Style {
+                    width: Val::Px(680.0),
+                    max_height: Val::Percent(88.0),
+                    padding: UiRect::all(Val::Px(24.0)),
+                    border: UiRect::all(Val::Px(2.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(10.0),
+                    overflow: Overflow::clip_y(),
+                    ..default()
+                },
+                background_color: BackgroundColor(PANEL_COLOR),
+                border_color: BorderColor(PANEL_BORDER),
+                ..default()
+            })
+            .with_children(|panel| {
+                panel.spawn(TextBundle::from_section("HOW TO PLAY", title));
+
+                panel.spawn(TextBundle::from_section("CONTROLS", heading.clone()));
+                panel.spawn(TextBundle::from_section(
+                    "WASD / Arrows  -  Move\n\
+                     Mouse  -  Aim\n\
+                     Left Click  -  Shoot\n\
+                     Right Click  -  Throw grenade\n\
+                     1 / 2 / 3  -  Switch weapon slot\n\
+                     R  -  Reload weapon\n\
+                     ESC  -  Pause",
+                    body.clone(),
+                ));
+
+                panel.spawn(TextBundle::from_section("WEAPONS & ITEMS", heading.clone()));
+                panel.spawn(TextBundle::from_section(
+                    "Slot 1 & 2 hold weapons. Pick up new ones on the map.\n\
+                     Slot 3 holds throwables: Grenades, Smoke, Molotovs.\n\
+                     Weapons auto-reload when magazine is empty.\n\
+                     Press R to reload manually at any time.",
+                    body.clone(),
+                ));
+
+                panel.spawn(TextBundle::from_section("ENEMIES", heading.clone()));
+                panel.spawn(TextBundle::from_section(
+                    "Normal  -  Standard zombie\n\
+                     Fast  -  Quick but fragile\n\
+                     Exploder  -  Explodes on contact! Keep distance\n\
+                     Burning  -  Sets you on fire (35 HP over 10s). Avoid!\n\
+                     Giant  -  Massive HP, very slow. Appears after wave 5",
+                    body.clone(),
+                ));
+
+                panel.spawn(TextBundle::from_section("SURVIVAL TIPS", heading));
+                panel.spawn(TextBundle::from_section(
+                    "Keep moving - standing still is death.\n\
+                     Prioritize Exploders and Burning zombies.\n\
+                     Use grenades on large groups of zombies.\n\
+                     Smoke grenades slow zombies - great for escaping.\n\
+                     Collect weapon and health pickups on the map.\n\
+                     Unlock new map zones to access the shop.",
+                    body,
+                ));
+
+                panel.spawn(
+                    TextBundle::from_section(
+                        "PRESS ESC / ENTER TO GO BACK",
+                        hint,
+                    )
+                    .with_style(Style {
+                        margin: UiRect::top(Val::Px(10.0)),
+                        ..default()
+                    }),
+                );
+            });
+        });
+}
+
+fn despawn_guide(mut commands: Commands, q: Query<Entity, With<GuideRoot>>) {
+    for e in &q {
+        commands.entity(e).despawn_recursive();
+    }
+}
+
+fn guide_input(keys: Res<ButtonInput<KeyCode>>, mut next_state: ResMut<NextState<GameState>>) {
+    if keys.just_pressed(KeyCode::Escape)
+        || keys.just_pressed(KeyCode::Enter)
+        || keys.just_pressed(KeyCode::Space)
+    {
+        next_state.set(GameState::Menu);
     }
 }

@@ -5,13 +5,13 @@ use rand::Rng;
 use std::collections::HashSet;
 
 use crate::audio::SfxEvent;
-use crate::bullet::ShootEvent;
+use crate::bullet::{ShootEvent, ThrowEvent};
 use crate::map::{MapObstacles, MAP_HEIGHT, MAP_WIDTH};
 use crate::net::{
     is_authoritative, LocalInput, NetContext, NetEntities, NetMode, RemoteInputs,
 };
 use crate::pixelart::{Canvas, Rgba};
-use crate::weapon::Weapon;
+use crate::weapon::{ThrowableKind, Weapon};
 use crate::{gameplay_active, GameState, Score};
 
 const PLAYER_SPRITE_SIZE: Vec2 = Vec2::new(30.0, 25.0);
@@ -28,7 +28,30 @@ pub struct Player {
     pub fire_cooldown: f32,
     pub invuln_timer: f32,
     pub aim: Vec2,
-    pub weapon: Weapon,
+    // Inventory: 2 weapon slots + throwable
+    pub slots: [Option<Weapon>; 2],
+    pub active_slot: u8, // 0 or 1 = weapon, 2 = throwable
+    pub ammo: [u32; 2],
+    pub reserve_ammo: [u32; 2],
+    pub reload_timer: f32,
+    pub throwable_kind: ThrowableKind,
+    pub throwable_count: u32,
+    pub throw_cooldown: f32,
+}
+
+impl Player {
+    pub fn active_weapon(&self) -> Weapon {
+        if self.active_slot <= 1 {
+            self.slots[self.active_slot as usize].unwrap_or(Weapon::Pistol)
+        } else {
+            Weapon::Pistol
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn weapon_in_slot(&self, slot: usize) -> Option<Weapon> {
+        self.slots.get(slot).copied().flatten()
+    }
 }
 
 #[derive(Event)]
@@ -102,40 +125,85 @@ fn player_palette(id: u8) -> (Rgba, Rgba, Rgba) {
 fn build_player_image(id: u8) -> Image {
     let (body_light, body_main, body_dark) = player_palette(id);
     let outline: Rgba = [14, 12, 8, 255];
-    let skin: Rgba = [232, 196, 148, 255];
-    let skin_light: Rgba = [252, 222, 184, 255];
-    let hair: Rgba = [36, 22, 12, 255];
-    let gun: Rgba = [46, 46, 56, 255];
-    let gun_light: Rgba = [92, 92, 104, 255];
-    let stock: Rgba = [118, 72, 30, 255];
-    let stock_dark: Rgba = [72, 42, 15, 255];
+    let skin: Rgba = [225, 185, 140, 255];
+    let skin_shadow: Rgba = [188, 148, 108, 255];
+    let eye: Rgba = [32, 22, 14, 255];
+    let vest: Rgba = [44, 48, 40, 255];
+    let vest_dark: Rgba = [28, 32, 24, 255];
+    let vest_hi: Rgba = [62, 66, 54, 255];
+    let belt: Rgba = [34, 28, 16, 255];
+    let pouch: Rgba = [50, 42, 26, 255];
+    let boot: Rgba = [22, 18, 12, 255];
+    let gun_body: Rgba = [42, 42, 50, 255];
+    let gun_hi: Rgba = [78, 78, 88, 255];
+    let gun_dark: Rgba = [22, 22, 28, 255];
+    let stock: Rgba = [72, 46, 20, 255];
+    let stock_dark: Rgba = [48, 30, 12, 255];
+    let muzzle: Rgba = [56, 56, 62, 255];
 
     let mut c = Canvas::new(25, 21);
 
-    c.fill_circle(12, 10, 8, outline);
-    c.fill_circle(12, 10, 7, body_dark);
-    c.fill_circle(12, 10, 6, body_main);
-    c.fill_circle(10, 8, 3, body_light);
+    // Body
+    c.fill_circle(9, 10, 7, outline);
+    c.fill_circle(9, 10, 6, body_dark);
+    c.fill_circle(9, 10, 5, body_main);
+    c.fill_circle(7, 8, 2, body_light);
 
-    c.fill_rect(10, 8, 3, 5, body_dark);
-    c.put(11, 10, body_main);
+    // Boots
+    c.put(5, 15, boot);
+    c.put(6, 15, boot);
+    c.put(12, 15, boot);
+    c.put(13, 15, boot);
 
-    c.fill_rect(17, 9, 4, 3, stock_dark);
-    c.fill_rect(17, 9, 4, 1, stock);
-    c.put(17, 10, stock);
+    // Tactical vest
+    c.fill_rect(5, 6, 8, 8, vest_dark);
+    c.fill_rect(6, 7, 6, 6, vest);
+    c.put(6, 7, vest_hi);
+    c.put(7, 7, vest_hi);
+    c.put(6, 8, vest_hi);
+    // Vest pockets
+    c.fill_rect(7, 10, 2, 2, vest_dark);
+    c.fill_rect(10, 10, 2, 2, vest_dark);
 
-    c.fill_rect(19, 10, 6, 2, gun);
-    c.fill_rect(19, 10, 6, 1, gun_light);
+    // Belt with pouches
+    c.fill_rect(4, 13, 10, 1, belt);
+    c.fill_rect(5, 13, 2, 1, pouch);
+    c.fill_rect(10, 13, 2, 1, pouch);
+
+    // Weapon stock
+    c.fill_rect(12, 9, 3, 3, stock_dark);
+    c.fill_rect(12, 9, 3, 1, stock);
+    c.put(12, 10, stock);
+
+    // Arm reaching to weapon
+    c.fill_rect(13, 8, 4, 3, outline);
+    c.fill_rect(13, 9, 3, 1, skin);
+    c.put(14, 8, skin_shadow);
+    c.put(15, 8, skin);
+
+    // Gun barrel
+    c.fill_rect(16, 9, 8, 3, gun_dark);
+    c.fill_rect(16, 9, 7, 2, gun_body);
+    c.fill_rect(16, 9, 4, 1, gun_hi);
+    c.put(23, 9, muzzle);
+    c.put(23, 10, muzzle);
+    c.put(24, 9, outline);
     c.put(24, 10, outline);
-    c.put(24, 11, outline);
 
+    // Head
     c.fill_circle(15, 10, 3, outline);
     c.fill_circle(15, 10, 2, skin);
-    c.put(16, 9, skin_light);
+    c.put(14, 9, skin_shadow);
 
-    c.fill_rect(12, 8, 2, 5, hair);
-    c.put(13, 8, outline);
-    c.put(13, 12, outline);
+    // Eye
+    c.put(17, 10, eye);
+
+    // Cap / helmet in player color
+    c.fill_rect(13, 7, 5, 2, outline);
+    c.fill_rect(13, 7, 4, 1, body_dark);
+    c.put(14, 7, body_main);
+    c.fill_rect(16, 6, 2, 2, body_main);
+    c.put(17, 6, body_light);
 
     c.into_image()
 }
@@ -163,7 +231,14 @@ pub fn spawn_player_entity(
                 fire_cooldown: 0.0,
                 invuln_timer: 0.0,
                 aim: Vec2::X,
-                weapon: Weapon::Pistol,
+                slots: [Some(Weapon::Pistol), None],
+                active_slot: 0,
+                ammo: [Weapon::Pistol.magazine_size(), 0],
+                reserve_ammo: [Weapon::Pistol.reserve_ammo(), 0],
+                reload_timer: 0.0,
+                throwable_kind: ThrowableKind::Grenade,
+                throwable_count: 3,
+                throw_cooldown: 0.0,
             },
         ))
         .id()
@@ -236,6 +311,19 @@ fn gather_local_input(
     local.0.move_x = mv.x;
     local.0.move_y = mv.y;
     local.0.shoot = mouse.pressed(MouseButton::Left);
+    local.0.throw = mouse.just_pressed(MouseButton::Right);
+    local.0.reload = keys.just_pressed(KeyCode::KeyR);
+
+    // Slot switching
+    local.0.switch_slot = if keys.just_pressed(KeyCode::Digit1) {
+        1
+    } else if keys.just_pressed(KeyCode::Digit2) {
+        2
+    } else if keys.just_pressed(KeyCode::Digit3) {
+        3
+    } else {
+        0
+    };
 
     let Ok(window) = windows.get_single() else {
         return;
@@ -273,6 +361,7 @@ fn server_player_tick(
     obstacles: Res<MapObstacles>,
     mut players: Query<(&mut Transform, &mut Player)>,
     mut shoot_events: EventWriter<ShootEvent>,
+    mut throw_events: EventWriter<ThrowEvent>,
     mut sfx: EventWriter<SfxEvent>,
 ) {
     let dt = time.delta_seconds();
@@ -317,15 +406,101 @@ fn server_player_tick(
         if player.invuln_timer > 0.0 {
             player.invuln_timer -= dt;
         }
+        if player.throw_cooldown > 0.0 {
+            player.throw_cooldown -= dt;
+        }
 
-        if input.shoot && player.fire_cooldown <= 0.0 && player.hp > 0 {
-            let weapon = player.weapon;
+        // Slot switching (1/2/3)
+        match input.switch_slot {
+            1 => {
+                if player.active_slot != 0 {
+                    player.active_slot = 0;
+                    player.reload_timer = 0.0;
+                    player.fire_cooldown = 0.15;
+                }
+            }
+            2 => {
+                if player.slots[1].is_some() && player.active_slot != 1 {
+                    player.active_slot = 1;
+                    player.reload_timer = 0.0;
+                    player.fire_cooldown = 0.15;
+                }
+            }
+            3 => {
+                if player.throwable_count > 0 && player.active_slot != 2 {
+                    player.active_slot = 2;
+                    player.reload_timer = 0.0;
+                }
+            }
+            _ => {}
+        }
+
+        // Reload logic (auto-reload when magazine empty, or manual with R)
+        let slot = player.active_slot as usize;
+        if slot <= 1 {
+            if let Some(weapon) = player.slots[slot] {
+                if !weapon.has_infinite_ammo() {
+                    // Start reload: manual (R) or auto when magazine empty
+                    if player.reload_timer <= 0.0
+                        && player.ammo[slot] < weapon.magazine_size()
+                        && player.reserve_ammo[slot] > 0
+                        && (input.reload || player.ammo[slot] == 0)
+                    {
+                        player.reload_timer = weapon.reload_time();
+                        player.fire_cooldown = weapon.reload_time();
+                    }
+                    // Complete reload
+                    if player.reload_timer > 0.0 {
+                        player.reload_timer -= dt;
+                        if player.reload_timer <= 0.0 {
+                            let need = weapon.magazine_size() - player.ammo[slot];
+                            let fill = need.min(player.reserve_ammo[slot]);
+                            player.ammo[slot] += fill;
+                            player.reserve_ammo[slot] -= fill;
+                            player.reload_timer = 0.0;
+                        }
+                    }
+                }
+            }
+        }
+
+        if player.hp <= 0 {
+            continue;
+        }
+
+        // Throw (right click or left click when slot 3)
+        let wants_throw = input.throw || (input.shoot && player.active_slot == 2);
+        if wants_throw && player.throw_cooldown <= 0.0 && player.throwable_count > 0 {
+            let origin = transform.translation.truncate() + player.aim * (PLAYER_RADIUS + 6.0);
+            throw_events.send(ThrowEvent {
+                origin,
+                direction: player.aim,
+                kind: player.throwable_kind,
+            });
+            player.throwable_count -= 1;
+            player.throw_cooldown = 0.6;
+            sfx.send(SfxEvent::Shot);
+            // Switch back to weapon if throwables ran out
+            if player.throwable_count == 0 && player.active_slot == 2 {
+                player.active_slot = 0;
+            }
+            continue;
+        }
+
+        // Shooting (only from weapon slots)
+        if player.active_slot > 1 {
+            continue;
+        }
+        let weapon = player.active_weapon();
+        let has_ammo = weapon.has_infinite_ammo() || player.ammo[slot] > 0;
+        if input.shoot && player.fire_cooldown <= 0.0 && has_ammo && player.reload_timer <= 0.0 {
             player.fire_cooldown = weapon.fire_cooldown();
             let origin = transform.translation.truncate() + player.aim * (PLAYER_RADIUS + 8.0);
             let count = weapon.bullet_count();
             let spread = weapon.spread();
             let damage = weapon.bullet_damage();
             let speed = weapon.bullet_speed();
+            let is_rocket = weapon.is_rocket();
             let mut rng = rand::thread_rng();
             for _ in 0..count {
                 let angle = if spread > 0.0 {
@@ -343,7 +518,12 @@ fn server_player_tick(
                     direction: dir,
                     damage,
                     speed,
+                    is_rocket,
                 });
+            }
+            // Consume ammo
+            if !weapon.has_infinite_ammo() {
+                player.ammo[slot] = player.ammo[slot].saturating_sub(1);
             }
             sfx.send(SfxEvent::Shot);
         }
@@ -358,6 +538,9 @@ fn player_damage_handler(
     mut sfx: EventWriter<SfxEvent>,
     mut next_state: ResMut<NextState<GameState>>,
 ) {
+    if events.is_empty() {
+        return;
+    }
     let mut newly_dead: HashSet<u8> = HashSet::new();
     for ev in events.read() {
         for (_, mut player) in &mut players {

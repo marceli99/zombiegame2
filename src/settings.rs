@@ -18,6 +18,26 @@ pub const FPS_CAPS: [Option<u32>; 5] = [
     Some(240),
 ];
 
+pub const QUALITY_LABELS: [&str; 4] = ["LOW", "MEDIUM", "HIGH", "ULTRA"];
+
+pub struct QualityPreset {
+    pub dirt: usize,
+    pub leaves: usize,
+    pub twigs: usize,
+    pub grass: usize,
+    pub bushes: usize,
+    pub trees: usize,
+    pub props: usize,
+    pub rain: usize,
+}
+
+pub const QUALITY_PRESETS: [QualityPreset; 4] = [
+    QualityPreset { dirt: 20, leaves: 60, twigs: 20, grass: 140, bushes: 30, trees: 100, props: 70, rain: 30 },
+    QualityPreset { dirt: 30, leaves: 100, twigs: 35, grass: 200, bushes: 45, trees: 160, props: 100, rain: 50 },
+    QualityPreset { dirt: 40, leaves: 160, twigs: 50, grass: 280, bushes: 60, trees: 210, props: 140, rain: 70 },
+    QualityPreset { dirt: 60, leaves: 240, twigs: 70, grass: 380, bushes: 80, trees: 280, props: 200, rain: 100 },
+];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WindowModeChoice {
     Windowed,
@@ -55,15 +75,19 @@ pub struct GraphicsSettings {
     pub window_mode: WindowModeChoice,
     pub vsync: bool,
     pub fps_cap_idx: usize,
+    pub quality_idx: usize,
+    pub show_fps: bool,
 }
 
 impl Default for GraphicsSettings {
     fn default() -> Self {
         Self {
             resolution_idx: 0,
-            window_mode: WindowModeChoice::Windowed,
+            window_mode: WindowModeChoice::Borderless,
             vsync: true,
             fps_cap_idx: 0,
+            quality_idx: 2,
+            show_fps: false,
         }
     }
 }
@@ -119,6 +143,31 @@ impl GraphicsSettings {
     pub fn toggle_vsync(&mut self) {
         self.vsync = !self.vsync;
     }
+
+    pub fn cycle_quality(&mut self, forward: bool) {
+        let len = QUALITY_LABELS.len();
+        self.quality_idx = if forward {
+            (self.quality_idx + 1) % len
+        } else {
+            (self.quality_idx + len - 1) % len
+        };
+    }
+
+    pub fn quality_label(&self) -> &'static str {
+        QUALITY_LABELS[self.quality_idx]
+    }
+
+    pub fn toggle_show_fps(&mut self) {
+        self.show_fps = !self.show_fps;
+    }
+
+    pub fn show_fps_label(&self) -> &'static str {
+        if self.show_fps { "ON" } else { "OFF" }
+    }
+
+    pub fn quality_preset(&self) -> &'static QualityPreset {
+        &QUALITY_PRESETS[self.quality_idx]
+    }
 }
 
 pub struct SettingsPlugin;
@@ -126,9 +175,35 @@ pub struct SettingsPlugin;
 impl Plugin for SettingsPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<GraphicsSettings>()
-            .add_systems(Update, apply_graphics_settings)
+            .add_systems(Update, (detect_initial_resolution, apply_graphics_settings))
             .add_systems(Last, fps_limiter);
     }
+}
+
+fn detect_initial_resolution(
+    mut settings: ResMut<GraphicsSettings>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut ran: Local<bool>,
+) {
+    if *ran {
+        return;
+    }
+    *ran = true;
+    let Ok(window) = windows.get_single() else {
+        return;
+    };
+    let w = window.physical_width();
+    let h = window.physical_height();
+    let mut best = 0;
+    let mut best_diff = u32::MAX;
+    for (i, &(rw, rh)) in RESOLUTIONS.iter().enumerate() {
+        let diff = w.abs_diff(rw) + h.abs_diff(rh);
+        if diff < best_diff {
+            best_diff = diff;
+            best = i;
+        }
+    }
+    settings.resolution_idx = best;
 }
 
 fn apply_graphics_settings(

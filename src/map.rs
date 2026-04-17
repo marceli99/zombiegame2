@@ -8,13 +8,27 @@ use rand::{Rng, SeedableRng};
 use crate::net::NetContext;
 use crate::pixelart::{Canvas, Rgba};
 use crate::player::Player;
+use crate::settings::GraphicsSettings;
 use crate::GameState;
 
 pub const TILE_SIZE: f32 = 64.0;
-pub const MAP_COLS: i32 = 33;
-pub const MAP_ROWS: i32 = 21;
+pub const MAP_COLS: i32 = 51;
+pub const MAP_ROWS: i32 = 37;
 pub const MAP_WIDTH: f32 = MAP_COLS as f32 * TILE_SIZE;
 pub const MAP_HEIGHT: f32 = MAP_ROWS as f32 * TILE_SIZE;
+
+pub const ZONE0_ROW_MIN: i32 = 10;
+pub const ZONE0_ROW_MAX: i32 = 26;
+pub const ZONE1_ROW_MIN: i32 = 27;
+pub const ZONE1_ROW_MAX: i32 = 36;
+pub const ZONE2_ROW_MIN: i32 = 5;
+pub const ZONE2_ROW_MAX: i32 = 9;
+pub const ZONE3_ROW_MIN: i32 = 0;
+pub const ZONE3_ROW_MAX: i32 = 4;
+
+pub const BARRIER_NORTH_Y: f32 = 544.0;
+pub const BARRIER_SOUTH_Y: f32 = -544.0;
+pub const BARRIER_UNDERGROUND_Y: f32 = -864.0;
 
 const ROAD_HALF_HEIGHT: f32 = 48.0;
 
@@ -114,11 +128,29 @@ impl MapObstacles {
         }
         false
     }
+
+    pub fn remove_at(&mut self, pos: Vec2) {
+        self.list.retain(|o| o.pos.distance_squared(pos) > 4.0);
+    }
 }
 
 #[derive(Component)]
 struct RainDrop {
     velocity: Vec2,
+}
+
+#[derive(Component)]
+struct Firefly {
+    base_pos: Vec2,
+    phase: f32,
+    drift_speed: f32,
+    drift_radius: f32,
+}
+
+#[derive(Component)]
+struct FogWisp {
+    speed: f32,
+    fade_phase: f32,
 }
 
 #[derive(Component)]
@@ -137,10 +169,10 @@ impl Plugin for MapPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<MapObstacles>()
             .init_resource::<NavGrid>()
-            .add_systems(Startup, (spawn_map, spawn_rain))
+            .add_systems(Startup, (spawn_map, spawn_rain, spawn_ultra_effects))
             .add_systems(
                 Update,
-                (update_rain, toggle_cabin_interior)
+                (update_rain, toggle_cabin_interior, update_fireflies, update_fog_wisps)
                     .run_if(in_state(GameState::Playing)),
             );
     }
@@ -157,13 +189,14 @@ pub fn tile_center(col: i32, row: i32) -> Vec2 {
 pub struct NavGrid {
     pub walkable: Vec<bool>,
     pub player_flow: HashMap<u8, Vec<u16>>,
+    pub player_flow_tile: HashMap<u8, (i32, i32)>,
 }
 
 impl Default for NavGrid {
     fn default() -> Self {
         let total = (MAP_COLS * MAP_ROWS) as usize;
         let mut walkable = vec![false; total];
-        for row in 0..MAP_ROWS {
+        for row in ZONE0_ROW_MIN..=ZONE0_ROW_MAX {
             for col in 0..MAP_COLS {
                 walkable[(row * MAP_COLS + col) as usize] = is_walkable_tile(col, row);
             }
@@ -171,16 +204,40 @@ impl Default for NavGrid {
         Self {
             walkable,
             player_flow: HashMap::new(),
+            player_flow_tile: HashMap::new(),
         }
     }
 }
 
-pub fn is_walkable_tile(_col: i32, _row: i32) -> bool {
+pub fn unlock_nav_rows(nav: &mut NavGrid, row_min: i32, row_max: i32) {
+    for row in row_min..=row_max {
+        for col in 0..MAP_COLS {
+            nav.walkable[(row * MAP_COLS + col) as usize] = is_walkable_tile(col, row);
+        }
+    }
+    nav.player_flow.clear();
+    nav.player_flow_tile.clear();
+}
+
+pub fn is_walkable_tile(col: i32, row: i32) -> bool {
+    let center = tile_center(col, row);
+    for cabin in CABINS {
+        let d = center - cabin.pos;
+        if d.x.abs() < cabin.half.x - 2.0 && d.y.abs() < cabin.half.y - 2.0 {
+            return false;
+        }
+    }
+    for wreck in WRECK_SPOTS {
+        let d = center - *wreck;
+        if d.x.abs() < WRECK_HALF.x - 4.0 && d.y.abs() < WRECK_HALF.y - 4.0 {
+            return false;
+        }
+    }
     true
 }
 
 pub fn in_bounds(col: i32, row: i32) -> bool {
-    col >= 0 && col < MAP_COLS && row >= 0 && row < MAP_ROWS
+    (0..MAP_COLS).contains(&col) && (0..MAP_ROWS).contains(&row)
 }
 
 pub fn nav_idx(col: i32, row: i32) -> usize {
@@ -280,21 +337,28 @@ const CABIN_DOOR_WIDTH: f32 = 28.0;
 const CABIN_WALL_THICK: f32 = 7.0;
 
 const CABINS: &[CabinSpec] = &[
-    // North side of road, doors facing south toward the street
-    CabinSpec { pos: Vec2::new(-820.0, 148.0), half: CABIN_HALF, door_side: DoorSide::South, kind: BuildingKind::Cabin },
-    CabinSpec { pos: Vec2::new(-500.0, 156.0), half: HOUSE_HALF, door_side: DoorSide::South, kind: BuildingKind::House },
-    CabinSpec { pos: Vec2::new(-180.0, 148.0), half: STORE_HALF, door_side: DoorSide::South, kind: BuildingKind::Store },
-    CabinSpec { pos: Vec2::new(180.0, 148.0), half: CABIN_HALF, door_side: DoorSide::South, kind: BuildingKind::Cabin },
-    CabinSpec { pos: Vec2::new(520.0, 156.0), half: HOUSE_HALF, door_side: DoorSide::South, kind: BuildingKind::House },
-    CabinSpec { pos: Vec2::new(860.0, 148.0), half: CABIN_HALF, door_side: DoorSide::South, kind: BuildingKind::Cabin },
-    // South side of road, doors facing north toward the street
-    CabinSpec { pos: Vec2::new(-900.0, -148.0), half: CABIN_HALF, door_side: DoorSide::North, kind: BuildingKind::Cabin },
-    CabinSpec { pos: Vec2::new(-600.0, -156.0), half: HOUSE_HALF, door_side: DoorSide::North, kind: BuildingKind::House },
-    CabinSpec { pos: Vec2::new(-280.0, -148.0), half: CABIN_HALF, door_side: DoorSide::North, kind: BuildingKind::Cabin },
-    CabinSpec { pos: Vec2::new(40.0, -148.0), half: STORE_HALF, door_side: DoorSide::North, kind: BuildingKind::Store },
-    CabinSpec { pos: Vec2::new(400.0, -156.0), half: HOUSE_HALF, door_side: DoorSide::North, kind: BuildingKind::House },
-    CabinSpec { pos: Vec2::new(720.0, -148.0), half: CABIN_HALF, door_side: DoorSide::North, kind: BuildingKind::Cabin },
+    // Zone 0 (center)
+    CabinSpec { pos: Vec2::new(-720.0, 156.0), half: HOUSE_HALF, door_side: DoorSide::South, kind: BuildingKind::House },
+    CabinSpec { pos: Vec2::new(-200.0, 148.0), half: STORE_HALF, door_side: DoorSide::South, kind: BuildingKind::Store },
+    CabinSpec { pos: Vec2::new(340.0, 148.0), half: CABIN_HALF, door_side: DoorSide::South, kind: BuildingKind::Cabin },
+    CabinSpec { pos: Vec2::new(-440.0, -156.0), half: HOUSE_HALF, door_side: DoorSide::North, kind: BuildingKind::House },
+    CabinSpec { pos: Vec2::new(160.0, -148.0), half: CABIN_HALF, door_side: DoorSide::North, kind: BuildingKind::Cabin },
+    // Zone 1 (north)
+    CabinSpec { pos: Vec2::new(-600.0, 740.0), half: HOUSE_HALF, door_side: DoorSide::South, kind: BuildingKind::House },
+    CabinSpec { pos: Vec2::new(200.0, 780.0), half: STORE_HALF, door_side: DoorSide::South, kind: BuildingKind::Store },
+    CabinSpec { pos: Vec2::new(800.0, 720.0), half: CABIN_HALF, door_side: DoorSide::South, kind: BuildingKind::Cabin },
+    // Zone 2 (south surface)
+    CabinSpec { pos: Vec2::new(-500.0, -680.0), half: CABIN_HALF, door_side: DoorSide::North, kind: BuildingKind::Cabin },
+    CabinSpec { pos: Vec2::new(400.0, -700.0), half: HOUSE_HALF, door_side: DoorSide::North, kind: BuildingKind::House },
 ];
+
+const WRECK_SPOTS: &[Vec2] = &[
+    Vec2::new(-620.0, -20.0),
+    Vec2::new(-140.0, 24.0),
+    Vec2::new(260.0, -38.0),
+    Vec2::new(720.0, 18.0),
+];
+const WRECK_HALF: Vec2 = Vec2::new(30.0, 13.0);
 
 fn on_road(p: Vec2) -> bool {
     p.y.abs() < ROAD_HALF_HEIGHT
@@ -409,19 +473,18 @@ fn plaza_clear(p: Vec2) -> bool {
     p.length_squared() < 160.0 * 160.0
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_map(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut images: ResMut<Assets<Image>>,
     mut obstacles: ResMut<MapObstacles>,
+    gfx: Res<GraphicsSettings>,
 ) {
+    let preset = gfx.quality_preset();
     let tile_mesh = meshes.add(Rectangle::new(TILE_SIZE, TILE_SIZE));
     let leaf_mesh = meshes.add(Rectangle::new(3.0, 3.0));
     let twig_mesh = meshes.add(Rectangle::new(8.0, 1.5));
-    let puddle_mesh = meshes.add(Ellipse::new(22.0, 12.0));
-    let puddle_small_mesh = meshes.add(Ellipse::new(14.0, 8.0));
     let road_mesh = meshes.add(Rectangle::new(MAP_WIDTH, ROAD_HALF_HEIGHT * 2.0));
     let road_shoulder_mesh = meshes.add(Rectangle::new(MAP_WIDTH, 6.0));
     let road_edge_mesh = meshes.add(Rectangle::new(MAP_WIDTH, 1.5));
@@ -429,19 +492,10 @@ fn spawn_map(
     let tire_track_mesh = meshes.add(Rectangle::new(44.0, 1.6));
     let pothole_mesh = meshes.add(Ellipse::new(10.0, 6.0));
 
-    let forest_mats = [
-        materials.add(Color::srgb(0.085, 0.125, 0.07)),
-        materials.add(Color::srgb(0.11, 0.15, 0.08)),
-        materials.add(Color::srgb(0.095, 0.125, 0.065)),
-        materials.add(Color::srgb(0.13, 0.16, 0.085)),
-        materials.add(Color::srgb(0.08, 0.115, 0.08)),
-    ];
     let dirt_patch_mats = [
         materials.add(Color::srgb(0.16, 0.12, 0.07)),
         materials.add(Color::srgb(0.18, 0.14, 0.08)),
     ];
-    let wet_mat = materials.add(Color::srgb(0.07, 0.1, 0.1));
-
     let road_main_mat = materials.add(Color::srgb(0.05, 0.05, 0.058));
     let road_shoulder_mat = materials.add(Color::srgba(0.09, 0.075, 0.045, 0.9));
     let road_edge_mat = materials.add(Color::srgba(0.015, 0.015, 0.02, 0.95));
@@ -456,9 +510,6 @@ fn spawn_map(
         materials.add(Color::srgb(0.3, 0.22, 0.08)),
     ];
     let twig_mat = materials.add(Color::srgb(0.12, 0.08, 0.03));
-    let puddle_mat = materials.add(Color::srgba(0.04, 0.07, 0.09, 0.85));
-    let puddle_rim_mat = materials.add(Color::srgba(0.12, 0.16, 0.18, 0.45));
-
     let overcast_mat = materials.add(Color::srgba(0.04, 0.06, 0.1, 0.18));
 
     let pine_a_image = images.add(build_pine_image(0));
@@ -474,16 +525,30 @@ fn spawn_map(
     let fern_image = images.add(build_fern_image());
     let grass_image = images.add(build_grass_image());
     let wreck_image = images.add(build_wrecked_car_image());
+    let ground_tiles: Vec<Handle<Image>> = (0..6)
+        .map(|i| images.add(build_ground_tile_image(i)))
+        .collect();
+    let underground_tiles: Vec<Handle<Image>> = (0..4)
+        .map(|i| images.add(build_underground_tile_image(i)))
+        .collect();
+    let pillar_image = images.add(build_pillar_image());
 
     let mut rng = StdRng::seed_from_u64(2027);
 
     for row in 0..MAP_ROWS {
         for col in 0..MAP_COLS {
             let center = tile_center(col, row);
-            let variant = rng.gen_range(0..forest_mats.len());
-            commands.spawn(MaterialMesh2dBundle {
-                mesh: Mesh2dHandle(tile_mesh.clone()),
-                material: forest_mats[variant].clone(),
+            let texture = if row <= ZONE3_ROW_MAX {
+                underground_tiles[rng.gen_range(0..underground_tiles.len())].clone()
+            } else {
+                ground_tiles[rng.gen_range(0..ground_tiles.len())].clone()
+            };
+            commands.spawn(SpriteBundle {
+                texture,
+                sprite: Sprite {
+                    custom_size: Some(Vec2::splat(TILE_SIZE + 1.0)),
+                    ..default()
+                },
                 transform: Transform::from_xyz(center.x, center.y, -10.0),
                 ..default()
             });
@@ -493,35 +558,20 @@ fn spawn_map(
     let half_w = MAP_WIDTH / 2.0 - 14.0;
     let half_h = MAP_HEIGHT / 2.0 - 14.0;
 
-    for _ in 0..60 {
+    for _ in 0..preset.dirt {
         let x = rng.gen_range(-half_w..half_w);
         let y = rng.gen_range(-half_h..half_h);
-        if on_road(Vec2::new(x, y)) {
+        let p = Vec2::new(x, y);
+        if on_road(p) || p.y < BARRIER_UNDERGROUND_Y {
             continue;
         }
         commands.spawn(MaterialMesh2dBundle {
             mesh: Mesh2dHandle(tile_mesh.clone()),
             material: dirt_patch_mats[rng.gen_range(0..dirt_patch_mats.len())].clone(),
-            transform: Transform::from_xyz(x, y, -9.9)
+            transform: Transform::from_xyz(x, y, -9.82)
                 .with_scale(Vec3::new(
                     rng.gen_range(0.6..1.0),
                     rng.gen_range(0.6..1.0),
-                    1.0,
-                )),
-            ..default()
-        });
-    }
-
-    for _ in 0..45 {
-        let x = rng.gen_range(-half_w..half_w);
-        let y = rng.gen_range(-half_h..half_h);
-        commands.spawn(MaterialMesh2dBundle {
-            mesh: Mesh2dHandle(tile_mesh.clone()),
-            material: wet_mat.clone(),
-            transform: Transform::from_xyz(x, y, -9.85)
-                .with_scale(Vec3::new(
-                    rng.gen_range(0.3..0.7),
-                    rng.gen_range(0.3..0.7),
                     1.0,
                 )),
             ..default()
@@ -596,9 +646,10 @@ fn spawn_map(
         });
     }
 
-    for _ in 0..260 {
+    for _ in 0..preset.leaves {
         let x = rng.gen_range(-half_w..half_w);
         let y = rng.gen_range(-half_h..half_h);
+        if y < BARRIER_UNDERGROUND_Y { continue; }
         commands.spawn(MaterialMesh2dBundle {
             mesh: Mesh2dHandle(leaf_mesh.clone()),
             material: leaf_mats[rng.gen_range(0..leaf_mats.len())].clone(),
@@ -606,40 +657,15 @@ fn spawn_map(
             ..default()
         });
     }
-    for _ in 0..90 {
+    for _ in 0..preset.twigs {
         let x = rng.gen_range(-half_w..half_w);
         let y = rng.gen_range(-half_h..half_h);
+        if y < BARRIER_UNDERGROUND_Y { continue; }
         let rot = rng.gen_range(-1.5_f32..1.5);
         commands.spawn(MaterialMesh2dBundle {
             mesh: Mesh2dHandle(twig_mesh.clone()),
             material: twig_mat.clone(),
             transform: Transform::from_xyz(x, y, -9.25)
-                .with_rotation(Quat::from_rotation_z(rot)),
-            ..default()
-        });
-    }
-
-    for _ in 0..55 {
-        let x = rng.gen_range(-half_w..half_w);
-        let y = rng.gen_range(-half_h..half_h);
-        let mesh = if rng.gen::<bool>() {
-            puddle_mesh.clone()
-        } else {
-            puddle_small_mesh.clone()
-        };
-        let rot = rng.gen_range(-0.4_f32..0.4);
-        commands.spawn(MaterialMesh2dBundle {
-            mesh: Mesh2dHandle(mesh.clone()),
-            material: puddle_rim_mat.clone(),
-            transform: Transform::from_xyz(x, y, -9.2)
-                .with_rotation(Quat::from_rotation_z(rot))
-                .with_scale(Vec3::splat(1.1)),
-            ..default()
-        });
-        commands.spawn(MaterialMesh2dBundle {
-            mesh: Mesh2dHandle(mesh),
-            material: puddle_mat.clone(),
-            transform: Transform::from_xyz(x, y, -9.18)
                 .with_rotation(Quat::from_rotation_z(rot)),
             ..default()
         });
@@ -686,11 +712,14 @@ fn spawn_map(
     let tree_min_dist = 48.0;
     let mut attempts = 0;
     let mut placed_trees = 0;
-    while placed_trees < 120 && attempts < 1500 {
+    while placed_trees < preset.trees && attempts < 2600 {
         attempts += 1;
         let x = rng.gen_range(-half_w + 30.0..half_w - 30.0);
         let y = rng.gen_range(-half_h + 30.0..half_h - 30.0);
         let p = Vec2::new(x, y);
+        if p.y < BARRIER_UNDERGROUND_Y {
+            continue;
+        }
         if plaza_clear(p) {
             continue;
         }
@@ -723,13 +752,7 @@ fn spawn_map(
         placed_trees += 1;
     }
 
-    let wreck_spots = [
-        Vec2::new(-620.0, -20.0),
-        Vec2::new(-140.0, 24.0),
-        Vec2::new(260.0, -38.0),
-        Vec2::new(720.0, 18.0),
-    ];
-    for p in wreck_spots {
+    for &p in WRECK_SPOTS {
         let rot = rng.gen_range(-0.6_f32..0.6);
         commands.spawn(SpriteBundle {
             texture: wreck_image.clone(),
@@ -743,18 +766,18 @@ fn spawn_map(
         });
         obstacles.list.push(Obstacle {
             pos: p,
-            shape: ObstacleShape::Rect(Vec2::new(30.0, 13.0)),
+            shape: ObstacleShape::Rect(WRECK_HALF),
         });
     }
 
     let mut placed_props = 0;
     let mut prop_attempts = 0;
-    while placed_props < 80 && prop_attempts < 600 {
+    while placed_props < preset.props && prop_attempts < 1000 {
         prop_attempts += 1;
         let x = rng.gen_range(-half_w..half_w);
         let y = rng.gen_range(-half_h..half_h);
         let p = Vec2::new(x, y);
-        if plaza_clear(p) || on_road(p) || near_cabin(p, 6.0) {
+        if p.y < BARRIER_UNDERGROUND_Y || plaza_clear(p) || on_road(p) || near_cabin(p, 6.0) {
             continue;
         }
         if obstacles.hits(p, 18.0) {
@@ -774,12 +797,12 @@ fn spawn_map(
                         .with_rotation(Quat::from_rotation_z(rot)),
                     ..default()
                 });
-                let (sx, sy) = rot.sin_cos();
+                let (sin_r, cos_r) = rot.sin_cos();
                 obstacles.list.push(Obstacle {
                     pos: p,
                     shape: ObstacleShape::Rect(Vec2::new(
-                        20.0 * sy.abs() + 7.0 * sx.abs(),
-                        7.0 * sy.abs() + 20.0 * sx.abs(),
+                        20.0 * cos_r.abs() + 7.0 * sin_r.abs(),
+                        7.0 * cos_r.abs() + 20.0 * sin_r.abs(),
                     )),
                 });
             }
@@ -843,11 +866,11 @@ fn spawn_map(
         placed_props += 1;
     }
 
-    for _ in 0..420 {
+    for _ in 0..preset.grass {
         let x = rng.gen_range(-half_w..half_w);
         let y = rng.gen_range(-half_h..half_h);
         let p = Vec2::new(x, y);
-        if on_road(p) || near_cabin(p, 2.0) {
+        if p.y < BARRIER_UNDERGROUND_Y || on_road(p) || near_cabin(p, 2.0) {
             continue;
         }
         if obstacles.hits(p, 6.0) {
@@ -868,11 +891,11 @@ fn spawn_map(
         });
     }
 
-    for _ in 0..80 {
+    for _ in 0..preset.bushes {
         let x = rng.gen_range(-half_w..half_w);
         let y = rng.gen_range(-half_h..half_h);
         let p = Vec2::new(x, y);
-        if on_road(p) || near_cabin(p, 4.0) {
+        if p.y < BARRIER_UNDERGROUND_Y || on_road(p) || near_cabin(p, 4.0) {
             continue;
         }
         if obstacles.hits(p, 10.0) {
@@ -890,6 +913,44 @@ fn spawn_map(
         });
     }
 
+    // Underground pillars (zone 3)
+    let ug_y_min = -MAP_HEIGHT / 2.0 + 40.0;
+    let ug_y_max = BARRIER_UNDERGROUND_Y - 40.0;
+    let mut placed_pillars = 0;
+    let mut pillar_attempts = 0;
+    while placed_pillars < 14 && pillar_attempts < 200 {
+        pillar_attempts += 1;
+        let x = rng.gen_range(-half_w + 60.0..half_w - 60.0);
+        let y = rng.gen_range(ug_y_min..ug_y_max);
+        let p = Vec2::new(x, y);
+        if near_cabin(p, 30.0) || obstacles.hits(p, 30.0) {
+            continue;
+        }
+        commands.spawn(SpriteBundle {
+            texture: pillar_image.clone(),
+            sprite: Sprite {
+                custom_size: Some(Vec2::splat(24.0)),
+                ..default()
+            },
+            transform: Transform::from_xyz(p.x, p.y, -1.5),
+            ..default()
+        });
+        obstacles.list.push(Obstacle {
+            pos: p,
+            shape: ObstacleShape::Circle(10.0),
+        });
+        placed_pillars += 1;
+    }
+
+    // Map boundary walls
+    let bw = 8.0;
+    let hw = MAP_WIDTH / 2.0;
+    let hh = MAP_HEIGHT / 2.0;
+    obstacles.list.push(Obstacle { pos: Vec2::new(0.0, hh + bw), shape: ObstacleShape::Rect(Vec2::new(hw, bw)) });
+    obstacles.list.push(Obstacle { pos: Vec2::new(0.0, -hh - bw), shape: ObstacleShape::Rect(Vec2::new(hw, bw)) });
+    obstacles.list.push(Obstacle { pos: Vec2::new(-hw - bw, 0.0), shape: ObstacleShape::Rect(Vec2::new(bw, hh)) });
+    obstacles.list.push(Obstacle { pos: Vec2::new(hw + bw, 0.0), shape: ObstacleShape::Rect(Vec2::new(bw, hh)) });
+
     commands.spawn(MaterialMesh2dBundle {
         mesh: Mesh2dHandle(meshes.add(Rectangle::new(MAP_WIDTH, MAP_HEIGHT))),
         material: overcast_mat,
@@ -902,13 +963,15 @@ fn spawn_rain(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
+    gfx: Res<GraphicsSettings>,
 ) {
+    let rain_count = gfx.quality_preset().rain;
     let rain_mesh = meshes.add(Rectangle::new(0.9, 9.0));
     let rain_mat = materials.add(Color::srgba(0.72, 0.8, 0.92, 0.22));
     let mut rng = StdRng::seed_from_u64(99);
     let half_w = 900.0;
     let half_h = 550.0;
-    for _ in 0..70 {
+    for _ in 0..rain_count {
         let x = rng.gen_range(-half_w..half_w);
         let y = rng.gen_range(-half_h..half_h);
         commands.spawn((
@@ -923,6 +986,28 @@ fn spawn_rain(
                 velocity: Vec2::new(-70.0, -720.0),
             },
         ));
+    }
+
+    // Ultra: second layer of fine, faster rain for depth
+    if gfx.quality_idx >= 3 {
+        let fine_mesh = meshes.add(Rectangle::new(0.5, 5.5));
+        let fine_mat = materials.add(Color::srgba(0.65, 0.72, 0.85, 0.12));
+        for _ in 0..50 {
+            let x = rng.gen_range(-half_w..half_w);
+            let y = rng.gen_range(-half_h..half_h);
+            commands.spawn((
+                MaterialMesh2dBundle {
+                    mesh: Mesh2dHandle(fine_mesh.clone()),
+                    material: fine_mat.clone(),
+                    transform: Transform::from_xyz(x, y, 38.0)
+                        .with_rotation(Quat::from_rotation_z(0.1)),
+                    ..default()
+                },
+                RainDrop {
+                    velocity: Vec2::new(-50.0, -920.0),
+                },
+            ));
+        }
     }
 }
 
@@ -951,6 +1036,121 @@ fn update_rain(
             t.translation.x = cx + rng.gen_range(-half_w..half_w);
             t.translation.y = cy + half_h + rng.gen_range(0.0..120.0);
         }
+    }
+}
+
+// ── Ultra-quality visual effects ──────────────────────────────────
+
+fn spawn_ultra_effects(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<ColorMaterial>>,
+    gfx: Res<GraphicsSettings>,
+) {
+    if gfx.quality_idx < 3 {
+        return;
+    }
+
+    // Fireflies / ambient dust motes
+    let firefly_mesh = meshes.add(Circle::new(1.8));
+    let firefly_mats = [
+        materials.add(Color::srgba(0.85, 0.92, 0.3, 0.55)),
+        materials.add(Color::srgba(0.7, 0.95, 0.45, 0.45)),
+        materials.add(Color::srgba(0.95, 0.88, 0.25, 0.5)),
+    ];
+    let mut rng = StdRng::seed_from_u64(7777);
+    let half_w = MAP_WIDTH / 2.0 - 40.0;
+    let half_h = MAP_HEIGHT / 2.0 - 40.0;
+
+    for _ in 0..45 {
+        let x = rng.gen_range(-half_w..half_w);
+        let y = rng.gen_range(-half_h..half_h);
+        let mat = firefly_mats[rng.gen_range(0..firefly_mats.len())].clone();
+        commands.spawn((
+            MaterialMesh2dBundle {
+                mesh: Mesh2dHandle(firefly_mesh.clone()),
+                material: mat,
+                transform: Transform::from_xyz(x, y, 25.0),
+                ..default()
+            },
+            Firefly {
+                base_pos: Vec2::new(x, y),
+                phase: rng.gen_range(0.0..std::f32::consts::TAU),
+                drift_speed: rng.gen_range(0.3..0.8),
+                drift_radius: rng.gen_range(12.0..30.0),
+            },
+        ));
+    }
+
+    // Ground fog wisps
+    let fog_mesh = meshes.add(Ellipse::new(60.0, 12.0));
+    let fog_mat = materials.add(Color::srgba(0.55, 0.6, 0.7, 0.08));
+    for _ in 0..30 {
+        let x = rng.gen_range(-half_w..half_w);
+        let y = rng.gen_range(-half_h..half_h);
+        commands.spawn((
+            MaterialMesh2dBundle {
+                mesh: Mesh2dHandle(fog_mesh.clone()),
+                material: fog_mat.clone(),
+                transform: Transform::from_xyz(x, y, 20.0)
+                    .with_scale(Vec3::new(
+                        rng.gen_range(0.6..1.5),
+                        rng.gen_range(0.7..1.3),
+                        1.0,
+                    )),
+                ..default()
+            },
+            FogWisp {
+                speed: rng.gen_range(8.0..22.0),
+                fade_phase: rng.gen_range(0.0..std::f32::consts::TAU),
+            },
+        ));
+    }
+}
+
+fn update_fireflies(
+    time: Res<Time>,
+    mut fireflies: Query<(&mut Transform, &Firefly)>,
+) {
+    let t = time.elapsed_seconds();
+    for (mut transform, ff) in &mut fireflies {
+        let angle = ff.phase + t * ff.drift_speed;
+        let secondary = ff.phase * 1.7 + t * ff.drift_speed * 0.6;
+        transform.translation.x = ff.base_pos.x
+            + angle.cos() * ff.drift_radius
+            + secondary.sin() * ff.drift_radius * 0.4;
+        transform.translation.y = ff.base_pos.y
+            + angle.sin() * ff.drift_radius * 0.7
+            + secondary.cos() * ff.drift_radius * 0.3;
+
+        // Pulse scale for a gentle glow flicker
+        let pulse = (t * ff.drift_speed * 2.5 + ff.phase).sin() * 0.3 + 0.85;
+        transform.scale = Vec3::splat(pulse);
+    }
+}
+
+fn update_fog_wisps(
+    time: Res<Time>,
+    mut wisps: Query<(&mut Transform, &FogWisp)>,
+) {
+    let t = time.elapsed_seconds();
+    let dt = time.delta_seconds();
+    for (mut transform, wisp) in &mut wisps {
+        transform.translation.x += wisp.speed * dt;
+
+        // Wrap around camera-independent — just wrap across map
+        let half_w = MAP_WIDTH / 2.0 + 80.0;
+        if transform.translation.x > half_w {
+            transform.translation.x = -half_w;
+        }
+
+        // Gentle vertical oscillation
+        let osc = (t * 0.4 + wisp.fade_phase).sin() * 0.8;
+        transform.translation.y += osc * dt * 6.0;
+
+        // Pulse opacity via scale
+        let alpha = (t * 0.3 + wisp.fade_phase).sin() * 0.25 + 0.85;
+        transform.scale.x = transform.scale.x.abs() * alpha.max(0.4);
     }
 }
 
@@ -1028,12 +1228,6 @@ fn build_cabin_image() -> Image {
     let h = 72;
     let mut c = Canvas::new(w, h);
 
-    for y in 0..h {
-        for x in 0..w {
-            c.put(x, y, transparent);
-        }
-    }
-
     let margin_x = 4;
     let margin_y = 4;
     c.fill_rect(margin_x, margin_y, w - margin_x * 2, h - margin_y * 2, outline);
@@ -1047,16 +1241,14 @@ fn build_cabin_image() -> Image {
 
     for y in (margin_y + 1)..(h - margin_y - 1) {
         for x in (margin_x + 1)..(w - margin_x - 1) {
-            let d = (y as i32 - h as i32 / 2).abs();
-            let mid = h as i32 / 2 - d;
+            let d = (y - h / 2).abs();
+            let mid = h / 2 - d;
             if mid < 4 && (x + y) % 2 == 0 {
                 c.put(x, y, shingle_hi);
             } else if d > 20 {
                 c.put(x, y, shingle_dark);
-            } else if d > 14 {
-                if (x + y) % 3 == 0 {
-                    c.put(x, y, shingle_light);
-                }
+            } else if d > 14 && (x + y) % 3 == 0 {
+                c.put(x, y, shingle_light);
             }
         }
     }
@@ -1166,12 +1358,6 @@ fn build_cabin_interior_image() -> Image {
     let w = 96;
     let h = 72;
     let mut c = Canvas::new(w, h);
-
-    for y in 0..h {
-        for x in 0..w {
-            c.put(x, y, transparent);
-        }
-    }
 
     let mx = 4;
     let my = 4;
@@ -1544,12 +1730,6 @@ fn build_house_image() -> Image {
     let h = 80;
     let mut c = Canvas::new(w, h);
 
-    for y in 0..h {
-        for x in 0..w {
-            c.put(x, y, transparent);
-        }
-    }
-
     let mx = 4;
     let my = 4;
     c.fill_rect(mx, my, w - mx * 2, h - my * 2, outline);
@@ -1561,9 +1741,7 @@ fn build_house_image() -> Image {
         for x in (mx + 1)..(w - mx - 1) {
             let tile_x = (x - mx - 1 + phase) % 6;
             let tile_y = (y - my - 1) % 3;
-            if tile_y == 0 {
-                c.put(x, y, tile_dark);
-            } else if tile_x == 0 || tile_x == 5 {
+            if tile_y == 0 || tile_x == 0 || tile_x == 5 {
                 c.put(x, y, tile_dark);
             } else if tile_y == 1 && (tile_x == 2 || tile_x == 3) {
                 c.put(x, y, tile_hi);
@@ -1642,12 +1820,6 @@ fn build_store_image() -> Image {
     let w = 120;
     let h = 72;
     let mut c = Canvas::new(w, h);
-
-    for y in 0..h {
-        for x in 0..w {
-            c.put(x, y, transparent);
-        }
-    }
 
     let mx = 4;
     let my = 4;
@@ -1753,12 +1925,6 @@ fn build_house_interior_image() -> Image {
     let w = 104;
     let h = 80;
     let mut c = Canvas::new(w, h);
-
-    for y in 0..h {
-        for x in 0..w {
-            c.put(x, y, transparent);
-        }
-    }
 
     let mx = 4;
     let my = 4;
@@ -1927,12 +2093,6 @@ fn build_store_interior_image() -> Image {
     let h = 72;
     let mut c = Canvas::new(w, h);
 
-    for y in 0..h {
-        for x in 0..w {
-            c.put(x, y, transparent);
-        }
-    }
-
     let mx = 4;
     let my = 4;
     c.fill_rect(mx, my, w - mx * 2, h - my * 2, wall_out);
@@ -2038,8 +2198,87 @@ fn build_store_interior_image() -> Image {
     c.into_image()
 }
 
+fn build_ground_tile_image(variant: u8) -> Image {
+    let mut c = Canvas::new(16, 16);
+
+    let bases: [[u8; 4]; 6] = [
+        [20, 28, 16, 255],
+        [24, 22, 14, 255],
+        [18, 26, 18, 255],
+        [22, 20, 12, 255],
+        [16, 24, 14, 255],
+        [20, 22, 16, 255],
+    ];
+    let base = bases[(variant % 6) as usize];
+    c.fill_rect(0, 0, 16, 16, base);
+
+    let dark: Rgba = [
+        base[0].saturating_sub(6),
+        base[1].saturating_sub(8),
+        base[2].saturating_sub(6),
+        255,
+    ];
+    let light: Rgba = [base[0] + 10, base[1] + 14, base[2] + 8, 255];
+    let root: Rgba = [32, 24, 14, 255];
+    let moss: Rgba = [24, 38, 18, 255];
+    let stone: Rgba = [32, 32, 36, 255];
+
+    for y in 0..16 {
+        for x in 0..16 {
+            let hash = ((x * 7 + y * 13 + variant as i32 * 31) & 0xFF) as u8;
+            match hash % 17 {
+                0 | 1 => { c.put(x, y, dark); }
+                2 => { c.put(x, y, light); }
+                3 if variant.is_multiple_of(2) => { c.put(x, y, moss); }
+                4 if variant.is_multiple_of(3) => { c.put(x, y, root); }
+                5 if variant == 3 || variant == 5 => { c.put(x, y, stone); }
+                _ => {}
+            }
+        }
+    }
+
+    match variant % 6 {
+        0 => {
+            c.fill_rect(3, 7, 10, 1, root);
+            c.put(4, 6, root);
+            c.put(11, 8, root);
+        }
+        1 => {
+            c.fill_rect(5, 5, 4, 3, moss);
+            c.put(6, 4, moss);
+        }
+        2 => {
+            c.put(4, 4, stone);
+            c.put(5, 4, stone);
+            c.put(10, 11, stone);
+            c.put(11, 11, stone);
+            c.put(11, 10, stone);
+        }
+        3 => {
+            let dirt: Rgba = [28, 22, 12, 255];
+            c.fill_rect(6, 6, 5, 4, dirt);
+            c.put(7, 5, dirt);
+            c.put(9, 10, dirt);
+        }
+        4 => {
+            let leaf_a: Rgba = [36, 26, 12, 255];
+            let leaf_b: Rgba = [30, 22, 10, 255];
+            for &(lx, ly) in &[(2, 3), (5, 8), (9, 2), (12, 10), (7, 13), (14, 5)] {
+                c.put(lx, ly, leaf_a);
+                c.put(lx + 1, ly, leaf_b);
+            }
+        }
+        _ => {
+            c.fill_rect(2, 10, 6, 1, root);
+            c.put(3, 9, root);
+            c.fill_rect(9, 3, 3, 2, moss);
+        }
+    }
+
+    c.into_image()
+}
+
 fn build_grass_image() -> Image {
-    let transparent: Rgba = [0, 0, 0, 0];
     let blade_dark: Rgba = [14, 32, 10, 255];
     let blade_main: Rgba = [28, 58, 18, 255];
     let blade_hi: Rgba = [52, 96, 30, 255];
@@ -2047,11 +2286,6 @@ fn build_grass_image() -> Image {
     let w = 10;
     let h = 8;
     let mut c = Canvas::new(w, h);
-    for y in 0..h {
-        for x in 0..w {
-            c.put(x, y, transparent);
-        }
-    }
     for y in 2..7 {
         c.put(2, y, blade_dark);
     }
@@ -2069,6 +2303,66 @@ fn build_grass_image() -> Image {
     c.put(5, 1, blade_hi);
     c.put(8, 4, blade_main);
     c.put(8, 6, blade_hi);
+    c.into_image()
+}
+
+fn build_underground_tile_image(variant: i32) -> Image {
+    let base: Rgba = match variant % 4 {
+        0 => [42, 42, 46, 255],
+        1 => [38, 38, 42, 255],
+        2 => [44, 44, 48, 255],
+        _ => [36, 36, 40, 255],
+    };
+    let crack: Rgba = [24, 24, 28, 255];
+    let stain: Rgba = [32, 30, 28, 255];
+    let highlight: Rgba = [52, 52, 56, 255];
+    let mut c = Canvas::new(16, 16);
+    c.fill_rect(0, 0, 16, 16, base);
+    for y in 0..16 {
+        for x in 0..16 {
+            let hash = ((x * 11 + y * 7 + variant * 23) & 0xFF) as u8;
+            if hash.is_multiple_of(19) {
+                c.put(x, y, highlight);
+            } else if hash.is_multiple_of(23) {
+                c.put(x, y, stain);
+            }
+        }
+    }
+    match variant % 4 {
+        0 => {
+            c.put(3, 7, crack); c.put(4, 8, crack); c.put(5, 8, crack);
+            c.put(12, 3, stain);
+        }
+        1 => {
+            c.put(8, 4, crack); c.put(9, 5, crack);
+            c.put(2, 12, stain); c.put(3, 12, stain);
+        }
+        2 => {
+            c.put(6, 10, crack); c.put(7, 11, crack);
+            c.put(13, 7, stain);
+        }
+        _ => {
+            c.put(4, 2, crack); c.put(10, 14, stain);
+            c.put(11, 14, stain); c.put(11, 13, crack);
+        }
+    }
+    c.into_image()
+}
+
+fn build_pillar_image() -> Image {
+    let outline: Rgba = [22, 22, 26, 255];
+    let concrete: Rgba = [90, 90, 95, 255];
+    let concrete_light: Rgba = [110, 110, 115, 255];
+    let concrete_dark: Rgba = [60, 60, 65, 255];
+    let crack: Rgba = [40, 40, 44, 255];
+    let mut c = Canvas::new(12, 12);
+    c.fill_circle(6, 6, 6, outline);
+    c.fill_circle(6, 6, 5, concrete);
+    c.fill_circle(5, 5, 3, concrete_light);
+    c.put(7, 7, concrete_dark);
+    c.put(8, 8, concrete_dark);
+    c.put(4, 8, crack);
+    c.put(3, 7, crack);
     c.into_image()
 }
 
