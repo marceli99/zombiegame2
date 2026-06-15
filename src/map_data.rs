@@ -46,7 +46,7 @@ pub struct Segment {
 /// All building archetypes the world generator can emit.  The current
 /// `world_consts.rs` doesn't instantiate `Civic` or `Market` but they're
 /// kept so re-baking with a different seed/spec stays compatible.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum BuildingType {
     House,
@@ -111,7 +111,7 @@ pub struct Building {
 /// All prop archetypes the world generator can emit.  `Car` and `Wreck`
 /// aren't used by the current bake but kept so a re-generation can use
 /// them without protocol changes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum PropKind {
     // Suburb / hospital flora

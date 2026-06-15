@@ -323,9 +323,20 @@ pub enum ClientInEvent {
     Chat { author: String, text: String },
 }
 
+/// What the host queues onto a client's writer channel.  `Msg` is a normal
+/// message the writer thread serializes per-client (lobby/chat/control —
+/// low frequency).  `Frame` is a pre-serialized, length-prefixed byte buffer
+/// shared (via `Arc`) across all clients: the 60 Hz snapshot is identical for
+/// everyone, so we serialize it once and hand each writer a cheap `Arc` clone
+/// instead of deep-cloning + re-serializing the whole snapshot per client.
+pub enum OutMsg {
+    Msg(ServerMsg),
+    Frame(Arc<[u8]>),
+}
+
 pub struct HostConn {
     pub events: Arc<Mutex<Receiver<ServerEvent>>>,
-    pub senders: Arc<Mutex<HashMap<u8, Sender<ServerMsg>>>>,
+    pub senders: Arc<Mutex<HashMap<u8, Sender<OutMsg>>>>,
     pub shutdown: Arc<AtomicBool>,
     /// Set when the round has actually started (GameState::Playing).  The
     /// listener thread reads this on each accept to reject mid-game joiners
@@ -469,7 +480,7 @@ pub fn start_host() -> std::io::Result<HostConn> {
     listener.set_nonblocking(true)?;
 
     let (event_tx, event_rx) = channel::<ServerEvent>();
-    let senders: Arc<Mutex<HashMap<u8, Sender<ServerMsg>>>> =
+    let senders: Arc<Mutex<HashMap<u8, Sender<OutMsg>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let shutdown = Arc::new(AtomicBool::new(false));
     let in_game = Arc::new(AtomicBool::new(false));
@@ -583,7 +594,7 @@ pub fn start_host() -> std::io::Result<HostConn> {
                 continue;
             }
 
-            let (out_tx, out_rx) = channel::<ServerMsg>();
+            let (out_tx, out_rx) = channel::<OutMsg>();
             senders_clone.lock().unwrap_or_else(|e| e.into_inner()).insert(id, out_tx);
             let _ = event_tx_clone.send(ServerEvent::Connected { id });
             let _ = event_tx_clone.send(ServerEvent::Hello {
@@ -596,8 +607,14 @@ pub fn start_host() -> std::io::Result<HostConn> {
                 Err(_) => continue,
             };
             thread::spawn(move || {
-                while let Ok(msg) = out_rx.recv() {
-                    if write_msg(&mut writer_stream, &msg).is_err() {
+                while let Ok(out) = out_rx.recv() {
+                    let res = match out {
+                        // Pre-framed snapshot bytes already carry the 4-byte
+                        // big-endian length prefix, so write them verbatim.
+                        OutMsg::Frame(frame) => writer_stream.write_all(&frame),
+                        OutMsg::Msg(msg) => write_msg(&mut writer_stream, &msg),
+                    };
+                    if res.is_err() {
                         break;
                     }
                 }
@@ -813,7 +830,29 @@ pub fn start_client(addr: SocketAddr, nickname: &str) -> std::io::Result<ClientC
 pub fn broadcast(host: &HostConn, msg: &ServerMsg) {
     let senders = host.senders.lock().unwrap_or_else(|e| e.into_inner());
     for tx in senders.values() {
-        let _ = tx.send(msg.clone());
+        let _ = tx.send(OutMsg::Msg(msg.clone()));
+    }
+}
+
+/// Serialize a message once into its on-wire frame (4-byte big-endian length
+/// prefix + bincode body — byte-identical to what `write_msg` produces) so it
+/// can be broadcast to every client without re-serializing per connection.
+/// Returns `None` if serialization fails (the caller simply skips the tick).
+pub fn encode_frame<T: Serialize>(msg: &T) -> Option<Arc<[u8]>> {
+    let bytes = bincode::serialize(msg).ok()?;
+    let len = bytes.len() as u32;
+    let mut framed = Vec::with_capacity(4 + bytes.len());
+    framed.extend_from_slice(&len.to_be_bytes());
+    framed.extend_from_slice(&bytes);
+    Some(framed.into())
+}
+
+/// Broadcast a pre-encoded frame (see `encode_frame`) to all clients.  Each
+/// client's writer gets a cheap `Arc` clone — no deep clone, no re-serialize.
+pub fn broadcast_frame(host: &HostConn, frame: &Arc<[u8]>) {
+    let senders = host.senders.lock().unwrap_or_else(|e| e.into_inner());
+    for tx in senders.values() {
+        let _ = tx.send(OutMsg::Frame(frame.clone()));
     }
 }
 

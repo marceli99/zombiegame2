@@ -9,7 +9,8 @@ use crate::bullet::{
 use crate::chat::ChatLog;
 use crate::map::MapSegmentUnlockState;
 use crate::net::{
-    broadcast, dq_pos, dq_radius, dq_rot, is_host, is_net_client, q_pos, q_radius, q_rot,
+    broadcast, broadcast_frame, dq_pos, dq_radius, dq_rot, encode_frame, is_host, is_net_client,
+    q_pos, q_radius, q_rot,
     ClientInEvent, ClientMsg, LocalInput, NetBulletState, NetContext, NetEntities,
     NetExplosionState, NetMode, NetPickupState, NetPlayerState, NetSnapshot, NetZombieState,
     PlayerNicknames, RemoteInputs, ServerEvent, ServerMsg,
@@ -348,7 +349,13 @@ fn server_broadcast_snapshot(
         destroyed_explodables: destroyed.indices.iter().copied().collect(),
     };
 
-    broadcast(host, &ServerMsg::Snapshot(Box::new(snap)));
+    // Snapshots are identical for every client, so serialize once into a
+    // shared frame and hand each writer a cheap Arc clone — instead of deep
+    // cloning + re-serializing the whole snapshot per connection on the main
+    // thread.  (If serialization ever fails we just skip this tick.)
+    if let Some(frame) = encode_frame(&ServerMsg::Snapshot(Box::new(snap))) {
+        broadcast_frame(host, &frame);
+    }
 }
 
 fn client_send_input(

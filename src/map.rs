@@ -47,7 +47,7 @@ pub const PLAYER_SPAWN_Y: f32 = -MAP_HEIGHT * 0.5 + 32.5 * TILE_SIZE;
 //  Wall side / spawn points
 // ════════════════════════════════════════════════════════════════════════
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum WallSide {
     N,
     S,
@@ -683,12 +683,18 @@ pub struct Staircase {
 pub struct PlayerFloorState {
     pub building: Option<usize>,
     pub floor: u8,
-    /// Decrementing seconds-since-last-stair-use.  Stops the
-    /// stand-on-staircase auto-trigger from cycling floors every tick.
-    /// Also bumped when the player climbs via E, so they can step off
-    /// without instantly being teleported back up.
-    pub stair_cooldown: f32,
 }
+
+/// Decrementing seconds-since-last-stair-use.  Stops the stand-on-staircase
+/// auto-trigger from cycling floors every tick; also bumped when the player
+/// climbs via E so they can step off without instantly being teleported back
+/// up.  Kept *separate* from `PlayerFloorState` on purpose: it ticks down
+/// every frame, and folding it into `PlayerFloorState` would mark that
+/// resource changed every frame, defeating the change-detection gate on the
+/// floor/roof toggle systems (`toggle_roof_walls`, `toggle_floor_obstacles`,
+/// `update_floor_entity_visibility`).
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct StairCooldown(pub f32);
 
 /// Per-building wall obstacle indices captured at spawn time.  When the
 /// local player is on a building's roof, those walls are temporarily
@@ -799,7 +805,7 @@ pub fn staircase_world_pos(b: &Building) -> Vec2 {
 /// but are reserved for future room layouts — `furniture_for_floor`
 /// doesn't currently place them.  Once added there, the dead_code allow
 /// can come off.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[allow(dead_code)]
 pub enum FurnKind {
     Bed,
@@ -1093,6 +1099,7 @@ impl Plugin for MapPlugin {
             .init_resource::<MapSegmentUnlockState>()
             .init_resource::<SegmentUnlockHint>()
             .init_resource::<PlayerFloorState>()
+            .init_resource::<StairCooldown>()
             .init_resource::<BuildingWallIndices>()
             .init_resource::<FloorObstacleIndices>()
             .init_resource::<DestroyedExplodables>()
@@ -1455,10 +1462,27 @@ fn spawn_map(
     }
 
     // ── Buildings: floor, walls (with door gap), roof, door, welcome mat ──
+    // Wall / floor / door / furniture textures are pure functions of small
+    // enums, so build each distinct one ONCE and share the `Handle` across
+    // every building/floor/item that needs it instead of allocating hundreds
+    // of byte-identical `Image` assets at startup.  The welcome mat and door
+    // frame are fully constant, so they're hoisted out of the loop entirely.
     let welcome_tex = images.add(build_welcome_mat_image());
+    let frame_tex = images.add(build_door_frame_image());
+    let mut wall_tex_cache: std::collections::HashMap<BuildingType, Handle<Image>> =
+        std::collections::HashMap::new();
+    let mut floor_tex_cache: std::collections::HashMap<BuildingType, Handle<Image>> =
+        std::collections::HashMap::new();
+    let mut door_tex_cache: std::collections::HashMap<(BuildingType, WallSide), Handle<Image>> =
+        std::collections::HashMap::new();
+    let mut furn_tex_cache: std::collections::HashMap<FurnKind, Handle<Image>> =
+        std::collections::HashMap::new();
     for (idx, b) in BUILDINGS.iter().enumerate() {
         let (center, half) = building_world_rect(b);
-        let wall_tex = images.add(build_building_wall_image(b.kind));
+        let wall_tex = wall_tex_cache
+            .entry(b.kind)
+            .or_insert_with(|| images.add(build_building_wall_image(b.kind)))
+            .clone();
 
         // Interior floors at z=-7 (above ground, below props/walls).  One
         // sprite per playable floor, all stacked at the same world coords
@@ -1473,7 +1497,10 @@ fn spawn_map(
         );
         let interior_count = interior_count.max(1);
         for floor in 0..interior_count {
-            let floor_tex = images.add(build_interior_floor_image(b.kind));
+            let floor_tex = floor_tex_cache
+                .entry(b.kind)
+                .or_insert_with(|| images.add(build_interior_floor_image(b.kind)))
+                .clone();
             commands.spawn((
                 SpriteBundle {
                     texture: floor_tex,
@@ -1545,7 +1572,10 @@ fn spawn_map(
         // signal comes from the door-frame markers below.
         let door_world = building_door_world(b);
         let side = building_door_side(b);
-        let door_tex = images.add(build_door_image(b.kind, side));
+        let door_tex = door_tex_cache
+            .entry((b.kind, side))
+            .or_insert_with(|| images.add(build_door_image(b.kind, side)))
+            .clone();
         let door_size = match side {
             WallSide::N | WallSide::S => Vec2::new(TILE_SIZE, BUILDING_WALL_THICK + 4.0),
             WallSide::E | WallSide::W => Vec2::new(BUILDING_WALL_THICK + 4.0, TILE_SIZE),
@@ -1563,8 +1593,7 @@ fn spawn_map(
         // External entry frame — two short side jambs flanking the door
         // tile, drawn ON the ground just outside the wall.  Subtle but
         // breaks up the wall silhouette so the player spots the entrance
-        // without a giant floating panel.
-        let frame_tex = images.add(build_door_frame_image());
+        // without a giant floating panel.  (Texture hoisted above the loop.)
         let frame_offset = TILE_SIZE * 0.5 + 3.0;
         let (frame_pos, frame_size) = match side {
             WallSide::N => (
@@ -1585,7 +1614,7 @@ fn spawn_map(
             ),
         };
         commands.spawn(SpriteBundle {
-            texture: frame_tex,
+            texture: frame_tex.clone(),
             sprite: Sprite {
                 custom_size: Some(frame_size),
                 ..default()
@@ -1636,7 +1665,10 @@ fn spawn_map(
                     continue;
                 }
                 let pos = Vec2::new(center.x + dx, center.y + dy);
-                let img = images.add(build_furniture_image(fk));
+                let img = furn_tex_cache
+                    .entry(fk)
+                    .or_insert_with(|| images.add(build_furniture_image(fk)))
+                    .clone();
                 // Decorative items (rugs, paintings, plants, lamps) render
                 // beneath solid furniture so a chair on a rug reads correctly.
                 let z = if furniture_collides(fk) { -6.0 } else { -6.7 };
@@ -1683,9 +1715,16 @@ fn spawn_map(
     }
 
     // ── Props per segment ─────────────────────────────────────────────────
+    // ~700 props collapse to ~30 distinct kinds; cache the texture per kind so
+    // we don't `images.add` hundreds of identical tree/bush/etc. images.
+    let mut prop_tex_cache: std::collections::HashMap<PropKind, Handle<Image>> =
+        std::collections::HashMap::new();
     for p in PROPS {
         let center = prop_world_center(p);
-        let img = images.add(build_prop_image(p.kind));
+        let img = prop_tex_cache
+            .entry(p.kind)
+            .or_insert_with(|| images.add(build_prop_image(p.kind)))
+            .clone();
         let size = prop_size_px(p);
         let z = prop_z(p.kind);
         let prop_entity = commands
@@ -1729,12 +1768,18 @@ fn spawn_map(
     // through grouped enemies.  Their obstacle entry is tracked so we can
     // remove it from the resolver once they detonate (otherwise the world
     // would still block movement at the wreck's old position).
+    let mut car_wreck_tex: Option<Handle<Image>> = None;
+    let mut fuel_barrel_tex: Option<Handle<Image>> = None;
     for spec in EXPLODABLES {
         let center = explodable_world_center(spec);
-        let img = images.add(match spec.kind {
-            ExplodableVisualKind::CarWreck => build_explodable_car_wreck_image(),
-            ExplodableVisualKind::FuelBarrel => build_explodable_fuel_barrel_image(),
-        });
+        let img = match spec.kind {
+            ExplodableVisualKind::CarWreck => car_wreck_tex
+                .get_or_insert_with(|| images.add(build_explodable_car_wreck_image()))
+                .clone(),
+            ExplodableVisualKind::FuelBarrel => fuel_barrel_tex
+                .get_or_insert_with(|| images.add(build_explodable_fuel_barrel_image()))
+                .clone(),
+        };
         let half = spec.kind.collision_half();
         let obs_idx = obstacles.list.len();
         obstacles.list.push(Obstacle {
@@ -2165,8 +2210,12 @@ fn spawn_multi_floor_extras(
     ));
 }
 
-fn reset_player_floor_state(mut state: ResMut<PlayerFloorState>) {
+fn reset_player_floor_state(
+    mut state: ResMut<PlayerFloorState>,
+    mut cooldown: ResMut<StairCooldown>,
+) {
     *state = PlayerFloorState::default();
+    cooldown.0 = 0.0;
 }
 
 fn track_player_building_floor(
@@ -2221,6 +2270,13 @@ fn update_floor_entity_visibility(
     state: Res<PlayerFloorState>,
     mut entities: Query<(&FloorEntity, &mut Visibility)>,
 ) {
+    // Floor visibility only changes when the player changes floor/building.
+    // `PlayerFloorState` is now mutated only on real transitions (the per-tick
+    // stair cooldown lives in its own resource), so this gate skips the full
+    // entity sweep on the vast majority of frames.
+    if !state.is_changed() {
+        return;
+    }
     for (fe, mut vis) in entities.iter_mut() {
         let want_visible = match state.building {
             Some(b) if b == fe.building => state.floor == fe.floor,
@@ -2249,12 +2305,13 @@ const STAIR_COOLDOWN_AFTER_CHANGE: f32 = 1.2;
 fn staircase_interact(
     time: Res<Time>,
     mut state: ResMut<PlayerFloorState>,
+    mut cooldown: ResMut<StairCooldown>,
     mut local: ResMut<crate::net::LocalInput>,
     players: Query<(&Transform, &Player)>,
     stairs: Query<(&Staircase, &Transform)>,
     ctx: Res<NetContext>,
 ) {
-    state.stair_cooldown = (state.stair_cooldown - time.delta_seconds()).max(0.0);
+    cooldown.0 = (cooldown.0 - time.delta_seconds()).max(0.0);
 
     let local_pos = players
         .iter()
@@ -2282,7 +2339,7 @@ fn staircase_interact(
             let kind = BUILDINGS[s.building].kind;
             let count = building_floor_count(kind);
             state.floor = (state.floor + 1) % count;
-            state.stair_cooldown = STAIR_COOLDOWN_AFTER_CHANGE;
+            cooldown.0 = STAIR_COOLDOWN_AFTER_CHANGE;
             local.0.interact = false;
             return;
         }
@@ -2290,11 +2347,11 @@ fn staircase_interact(
         // Auto-cycle: stepping directly onto the stair tile bumps you up
         // to the next floor automatically (with cooldown so you don't
         // teleport every tick while standing on it).
-        if dist_sq <= STAIR_AUTO_RADIUS * STAIR_AUTO_RADIUS && state.stair_cooldown <= 0.0 {
+        if dist_sq <= STAIR_AUTO_RADIUS * STAIR_AUTO_RADIUS && cooldown.0 <= 0.0 {
             let kind = BUILDINGS[s.building].kind;
             let count = building_floor_count(kind);
             state.floor = (state.floor + 1) % count;
-            state.stair_cooldown = STAIR_COOLDOWN_AFTER_CHANGE;
+            cooldown.0 = STAIR_COOLDOWN_AFTER_CHANGE;
             return;
         }
     }
@@ -2305,6 +2362,11 @@ fn toggle_roof_walls(
     indices: Res<BuildingWallIndices>,
     mut obstacles: ResMut<MapObstacles>,
 ) {
+    // Wall passability only changes on a floor/building transition; skip the
+    // ResMut<MapObstacles> acquisition + writes on unchanged frames.
+    if !state.is_changed() {
+        return;
+    }
     // Each frame, walls of the building the local player is on roof of
     // become non-collision (so the player can walk off the edge).  Walls
     // of every other multi-floor building are restored to their original
@@ -2333,6 +2395,10 @@ fn toggle_floor_obstacles(
     indices: Res<FloorObstacleIndices>,
     mut obstacles: ResMut<MapObstacles>,
 ) {
+    // Per-floor furniture solidity only changes on a floor/building transition.
+    if !state.is_changed() {
+        return;
+    }
     for ((b_idx, floor), items) in indices.by.iter() {
         let active = if *floor == 0 {
             // Ground-floor furniture stays solid as long as the player
@@ -2431,6 +2497,13 @@ fn update_building_roof_visibility(
         let target_alpha: f32 = if inside { 0.0 } else { 1.0 };
         let mut color = sprite.color.to_srgba();
         let cur = color.alpha;
+        // Roof already settled at its target alpha — skip the sprite/visibility
+        // writes so a resting roof (the common case: player nowhere near it)
+        // doesn't dirty the Sprite and force a renderer re-extract every frame.
+        // Identical visual result; the tween below is a no-op at the target.
+        if (target_alpha - cur).abs() < 1e-3 {
+            continue;
+        }
         let step = (target_alpha - cur).clamp(-dt * 4.0, dt * 4.0);
         color.alpha = (cur + step).clamp(0.0, 1.0);
         sprite.color = color.into();

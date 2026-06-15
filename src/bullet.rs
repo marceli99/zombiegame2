@@ -28,14 +28,32 @@ pub const REWIND_TICKS: usize = 6;
 #[derive(Resource, Default)]
 pub struct RewindBuffer {
     frames: VecDeque<HashMap<u32, Vec2>>,
+    /// Maps evicted from the back of `frames` are stashed here (cleared, but
+    /// keeping their allocated capacity) and handed back out via `take_frame`,
+    /// so the steady state allocates zero new `HashMap`s per tick.
+    spare: Vec<HashMap<u32, Vec2>>,
 }
 
 impl RewindBuffer {
-    /// Snapshot the current zombie poses; trim to `REWIND_TICKS + 1` frames.
+    /// Hand out a cleared, capacity-preserving map to fill this tick's poses.
+    /// Recycles an evicted frame if one is available, else allocates once.
+    pub fn take_frame(&mut self) -> HashMap<u32, Vec2> {
+        match self.spare.pop() {
+            Some(mut m) => {
+                m.clear();
+                m
+            }
+            None => HashMap::new(),
+        }
+    }
+    /// Snapshot the current zombie poses; trim to `REWIND_TICKS + 1` frames,
+    /// recycling the oldest map back into the spare pool.
     pub fn record(&mut self, snapshot: HashMap<u32, Vec2>) {
         self.frames.push_front(snapshot);
         while self.frames.len() > REWIND_TICKS + 1 {
-            self.frames.pop_back();
+            if let Some(old) = self.frames.pop_back() {
+                self.spare.push(old);
+            }
         }
     }
     /// Position from `ticks_back` ticks ago (saturating at the oldest entry).
@@ -46,6 +64,112 @@ impl RewindBuffer {
     }
     pub fn clear(&mut self) {
         self.frames.clear();
+    }
+}
+
+/// Side length of one zombie spatial-grid cell, in world px.  Mirrors
+/// `map_obstacles::ObstacleGrid`; 128 px keeps each cell to a handful of
+/// zombies while a hit query touches only ~1–4 cells.
+const ZOMBIE_GRID_CELL: f32 = 128.0;
+
+/// Conservative broad-phase query radius for the bullet→zombie hit test.  The
+/// grid bins each zombie by its **current** centre, but a lag-compensated hit
+/// can be tested against a *rewound* position up to `REWIND_TICKS` old.  This
+/// radius must upper-bound how far a real hit centre can sit from a candidate's
+/// bin so the grid never drops a zombie the exact distance test would accept.
+/// Budget: BULLET_RADIUS (3) + max zombie radius (Giant, 20) + max rewind
+/// displacement (235 px/s × 6/60 ≈ 24) ≈ 47, rounded up to 96 for margin.
+/// Being generous only widens the candidate set slightly; it can never cause a
+/// missed hit — the exact per-zombie distance test still decides every hit.
+const ZOMBIE_HIT_QUERY_RADIUS: f32 = 96.0;
+
+/// Spatial index over live zombies, rebuilt once per tick by
+/// `record_zombie_history` (same pass that snapshots the rewind buffer, so no
+/// extra full iteration).  Lets `bullet_collision` test each bullet against
+/// only nearby zombies instead of scanning all of them — turning the hot
+/// O(bullets × zombies) loop into O(bullets × local).  Each zombie is binned
+/// in exactly one cell (its centre), so candidates are yielded without dupes.
+#[derive(Resource, Default)]
+pub struct ZombieGrid {
+    cells: Vec<Vec<Entity>>,
+    cols: usize,
+    rows: usize,
+}
+
+impl ZombieGrid {
+    fn dims() -> (usize, usize) {
+        let cols = ((crate::map::MAP_WIDTH / ZOMBIE_GRID_CELL).ceil() as usize) + 1;
+        let height = crate::map::MAP_HEIGHT + crate::map_obstacles::UNDERGROUND_EXTENT_Y;
+        let rows = ((height / ZOMBIE_GRID_CELL).ceil() as usize) + 1;
+        (cols, rows)
+    }
+
+    #[inline]
+    fn world_to_cell(p: Vec2) -> (i32, i32) {
+        // Same coordinate transform as ObstacleGrid so underground (negative-Y)
+        // zombies land at non-negative cell indices.
+        let cx = ((p.x + crate::map::MAP_WIDTH * 0.5) / ZOMBIE_GRID_CELL).floor() as i32;
+        let cy = ((p.y - crate::map_obstacles::world_min_y()) / ZOMBIE_GRID_CELL).floor() as i32;
+        (cx, cy)
+    }
+
+    /// Clear and resize the grid for a fresh tick, preserving cell capacity.
+    fn begin(&mut self) {
+        let (cols, rows) = Self::dims();
+        self.cols = cols;
+        self.rows = rows;
+        let total = cols * rows;
+        if self.cells.len() != total {
+            self.cells.clear();
+            self.cells.resize_with(total, Vec::new);
+        } else {
+            for cell in &mut self.cells {
+                cell.clear();
+            }
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, e: Entity, p: Vec2) {
+        let (cx, cy) = Self::world_to_cell(p);
+        if cx < 0 || cy < 0 || cx >= self.cols as i32 || cy >= self.rows as i32 {
+            return;
+        }
+        self.cells[cy as usize * self.cols + cx as usize].push(e);
+    }
+
+    pub fn clear(&mut self) {
+        for cell in &mut self.cells {
+            cell.clear();
+        }
+    }
+
+    /// Push every zombie entity whose bin lies within `radius` of `center` into
+    /// `out`.  Conservative superset — the caller must still run the exact
+    /// distance test.  Each entity appears at most once (single-cell binning).
+    fn collect_candidates(&self, center: Vec2, radius: f32, out: &mut Vec<Entity>) {
+        if self.cells.is_empty() {
+            return;
+        }
+        let lo = Vec2::new(center.x - radius, center.y - radius);
+        let hi = Vec2::new(center.x + radius, center.y + radius);
+        let (c0, r0) = Self::world_to_cell(lo);
+        let (c1, r1) = Self::world_to_cell(hi);
+        // Fully out of bounds → no candidates (avoids the degenerate
+        // clamp-to-zero that would scan cell 0).
+        if c1 < 0 || r1 < 0 || c0 >= self.cols as i32 || r0 >= self.rows as i32 {
+            return;
+        }
+        let cs = c0.max(0) as usize;
+        let ce = (c1.min(self.cols as i32 - 1)).max(0) as usize;
+        let rs = r0.max(0) as usize;
+        let re = (r1.min(self.rows as i32 - 1)).max(0) as usize;
+        for r in rs..=re {
+            let row_off = r * self.cols;
+            for c in cs..=ce {
+                out.extend_from_slice(&self.cells[row_off + c]);
+            }
+        }
     }
 }
 
@@ -260,6 +384,7 @@ impl Plugin for BulletPlugin {
             .add_event::<ExplodeEvent>()
             .add_event::<ThrowEvent>()
             .init_resource::<RewindBuffer>()
+            .init_resource::<ZombieGrid>()
             .add_systems(Startup, setup_bullet_assets)
             .add_systems(OnExit(GameState::Playing), despawn_all_bullets)
             .add_systems(OnExit(GameState::Playing), reset_rewind_buffer)
@@ -831,22 +956,30 @@ fn spawn_impact_sparks(
     }
 }
 
-/// Snapshots the live zombie poses into `RewindBuffer`.  Runs at the top of
-/// the FixedUpdate chain so that `bullet_collision` later in the same tick
-/// can see "current" history.  Cheap: ~70 zombies × (u32 + Vec2) = small.
+/// Snapshots the live zombie poses into `RewindBuffer` **and** rebuilds the
+/// `ZombieGrid` spatial index in the same pass.  Runs at the top of the
+/// FixedUpdate chain so that `bullet_collision` later in the same tick sees
+/// "current" history and an up-to-date grid.  One iteration over all zombies
+/// feeds both; the rewind map is recycled so the steady state allocates
+/// nothing.
 fn record_zombie_history(
     mut rewind: ResMut<RewindBuffer>,
-    zombies: Query<(&Transform, &NetId), With<Zombie>>,
+    mut grid: ResMut<ZombieGrid>,
+    zombies: Query<(Entity, &Transform, &NetId), With<Zombie>>,
 ) {
-    let mut frame: HashMap<u32, Vec2> = HashMap::with_capacity(zombies.iter().count());
-    for (t, id) in &zombies {
-        frame.insert(id.0, t.translation.truncate());
+    let mut frame = rewind.take_frame();
+    grid.begin();
+    for (e, t, id) in &zombies {
+        let p = t.translation.truncate();
+        frame.insert(id.0, p);
+        grid.insert(e, p);
     }
     rewind.record(frame);
 }
 
-fn reset_rewind_buffer(mut rewind: ResMut<RewindBuffer>) {
+fn reset_rewind_buffer(mut rewind: ResMut<RewindBuffer>, mut grid: ResMut<ZombieGrid>) {
     rewind.clear();
+    grid.clear();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -854,17 +987,23 @@ fn bullet_collision(
     mut commands: Commands,
     assets: Res<BulletAssets>,
     rewind: Res<RewindBuffer>,
+    grid: Res<ZombieGrid>,
     ctx: Res<NetContext>,
     bullets: Query<(Entity, &Transform, &Bullet)>,
     mut zombies: Query<(Entity, &Transform, &mut Zombie, &NetId)>,
+    // Reused scratch for grid candidates — zero steady-state allocation.
+    mut z_candidates: Local<Vec<Entity>>,
     mut explodables: Query<(Entity, &Transform, &mut Explodable, &ExplodableObstacleIdx)>,
     mut obstacles: ResMut<MapObstacles>,
     mut destroyed: ResMut<DestroyedExplodables>,
     players: Query<&Player>,
-    mut killed: EventWriter<ZombieKilledEvent>,
-    mut explode: EventWriter<ExplodeEvent>,
-    mut dmg_numbers: EventWriter<DamageNumberEvent>,
-    mut sfx: EventWriter<SfxEvent>,
+    // Bundled into one tuple param to stay within Bevy's 16-param system limit.
+    (mut killed, mut explode, mut dmg_numbers, mut sfx): (
+        EventWriter<ZombieKilledEvent>,
+        EventWriter<ExplodeEvent>,
+        EventWriter<DamageNumberEvent>,
+        EventWriter<SfxEvent>,
+    ),
     mut score: ResMut<Score>,
 ) {
     let mult = max_money_mult(players.iter());
@@ -881,8 +1020,17 @@ fn bullet_collision(
         let rewind_for_this_bullet =
             bullet.shooter_id != 0 && bullet.shooter_id != host_local_id;
 
-        // Zombies first — they're the primary target.
-        for (z_entity, z_transform, mut zombie, z_net) in &mut zombies {
+        // Zombies first — they're the primary target.  Broad-phase via the
+        // spatial grid: only zombies binned near the bullet are candidates.
+        // The query radius is a conservative superset (covers lag-rewind
+        // displacement + max body radius), so the exact distance test below
+        // still decides every hit byte-for-byte as before.
+        z_candidates.clear();
+        grid.collect_candidates(bp, ZOMBIE_HIT_QUERY_RADIUS, &mut z_candidates);
+        for &z_entity in z_candidates.iter() {
+            let Ok((_, z_transform, mut zombie, z_net)) = zombies.get_mut(z_entity) else {
+                continue;
+            };
             if zombie.hp <= 0 {
                 continue;
             }

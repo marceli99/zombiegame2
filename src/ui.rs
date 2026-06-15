@@ -1349,6 +1349,9 @@ fn update_combo(
     mut events: EventReader<ZombieKilledEvent>,
     mut root: Query<&mut Visibility, (With<ComboCounterRoot>, Without<ComboCounterText>)>,
     mut text_q: Query<(&mut Text, &mut Transform), With<ComboCounterText>>,
+    // Last `count` we built the label string for; lets us skip the per-frame
+    // `format!` + clone and only rewrite the text value when the streak ticks up.
+    mut last_count: Local<u32>,
 ) {
     let dt = time.delta_seconds();
     state.time_since_kill += dt;
@@ -1380,28 +1383,33 @@ fn update_combo(
     }
 
     if !active {
+        // Force a label rebuild the next time a streak starts.
+        *last_count = 0;
         return;
     }
 
-    // Tiered label + colour.
-    let (label, color) = match state.count {
-        2..=4 => (
-            format!("x{} KILL", state.count),
-            Color::srgba(1.0, 0.96, 0.62, 1.0),
-        ),
-        5..=9 => (
-            format!("x{} STREAK", state.count),
-            Color::srgba(1.0, 0.78, 0.32, 1.0),
-        ),
-        10..=19 => (
-            format!("x{} RAMPAGE", state.count),
-            Color::srgba(1.0, 0.45, 0.20, 1.0),
-        ),
-        _ => (
-            format!("x{} UNSTOPPABLE", state.count),
-            Color::srgba(1.0, 0.18, 0.18, 1.0),
-        ),
+    // Tiered colour — a cheap alloc-free match, recomputed each frame so the
+    // fade alpha below stays live.
+    let color = match state.count {
+        2..=4 => Color::srgba(1.0, 0.96, 0.62, 1.0),
+        5..=9 => Color::srgba(1.0, 0.78, 0.32, 1.0),
+        10..=19 => Color::srgba(1.0, 0.45, 0.20, 1.0),
+        _ => Color::srgba(1.0, 0.18, 0.18, 1.0),
     };
+
+    // The text value only changes when the streak count does, so build the
+    // string (the one heap alloc here) only then — not every frame.
+    let new_label = if state.count != *last_count {
+        Some(match state.count {
+            2..=4 => format!("x{} KILL", state.count),
+            5..=9 => format!("x{} STREAK", state.count),
+            10..=19 => format!("x{} RAMPAGE", state.count),
+            _ => format!("x{} UNSTOPPABLE", state.count),
+        })
+    } else {
+        None
+    };
+    *last_count = state.count;
 
     // Fade out as the streak window runs out.
     let fade = ((COMBO_TIMEOUT - state.time_since_kill) / COMBO_TIMEOUT).clamp(0.0, 1.0);
@@ -1411,7 +1419,9 @@ fn update_combo(
 
     if let Ok((mut text, mut transform)) = text_q.get_single_mut() {
         for sec in &mut text.sections {
-            sec.value = label.clone();
+            if let Some(ref label) = new_label {
+                sec.value = label.clone();
+            }
             let mut c = color;
             c.set_alpha(fade);
             sec.style.color = c;
