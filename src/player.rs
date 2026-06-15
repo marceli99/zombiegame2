@@ -667,7 +667,7 @@ fn emit_walking_dust(
     spawn_walking_dust(&mut commands, &bullet_assets, p + offset);
 }
 
-fn gather_local_input(
+pub(crate) fn gather_local_input(
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,

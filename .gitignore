@@ -1,1 +1,6 @@
 target/
+release.keystore
+ios/lib/
+ios/build/
+ios/DerivedData/
+ios/*.xcodeproj/
