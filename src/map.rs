@@ -600,11 +600,13 @@ pub struct MapSegmentUnlockState {
 
 impl Default for MapSegmentUnlockState {
     fn default() -> Self {
-        // ⚠️ TESTING_UNLOCK_ALL — every segment open from the start so the
-        // player can roam the whole map.  Revert to the lines below for the
-        // normal money-gated progression:
-        //   let mut arr = [false; 5]; arr[0] = true; Self { unlocked: arr }
-        Self { unlocked: [true; 5] }
+        // Only segment 1 (the spawn area) is open at the start.  Segments 2-5
+        // are gated behind the money-buy barriers — the player walks up to a
+        // gate and pays its `cost` (see GATES / `unlock_segments_by_input`) to
+        // drop the barrier and clear the fog over the next segment.
+        let mut unlocked = [false; 5];
+        unlocked[0] = true;
+        Self { unlocked }
     }
 }
 
