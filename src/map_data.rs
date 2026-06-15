@@ -72,7 +72,7 @@ pub enum BuildingType {
     Gas,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RoofStyle {
     /// Pitched two-slope roof — houses, sheds, churches, market hall, park
     /// pavilion, gable tents.

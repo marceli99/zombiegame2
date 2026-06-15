@@ -1490,6 +1490,12 @@ fn spawn_map(
         std::collections::HashMap::new();
     let mut furn_tex_cache: std::collections::HashMap<FurnKind, Handle<Image>> =
         std::collections::HashMap::new();
+    // Roof image is a pure function of (kind, style, w, h); ~67 buildings
+    // collapse to ~50 distinct roofs, so cache by that key like the others.
+    let mut roof_tex_cache: std::collections::HashMap<
+        (BuildingType, RoofStyle, i32, i32),
+        Handle<Image>,
+    > = std::collections::HashMap::new();
     for (idx, b) in BUILDINGS.iter().enumerate() {
         let (center, half) = building_world_rect(b);
         let wall_tex = wall_tex_cache
@@ -1557,7 +1563,10 @@ fn spawn_map(
         // Roof at z=6 — above zombies (z=5) but below the player (z=10).
         // The visibility-toggle system hides this when the local player
         // is inside the building so the interior shows through.
-        let roof_tex = images.add(build_roof_image(b.kind, b.roof, b.w, b.h));
+        let roof_tex = roof_tex_cache
+            .entry((b.kind, b.roof, b.w, b.h))
+            .or_insert_with(|| images.add(build_roof_image(b.kind, b.roof, b.w, b.h)))
+            .clone();
         commands.spawn((
             SpriteBundle {
                 texture: roof_tex,
@@ -4578,14 +4587,50 @@ fn prop_size_px(p: &Prop) -> Vec2 {
 
 fn prop_z(kind: PropKind) -> f32 {
     use PropKind::*;
+    // Each kind gets its OWN z within its depth tier so same-kind sprites sort
+    // contiguously and the renderer can batch them into one draw call (cheaper
+    // on mobile, where per-draw overhead bites harder).  The tiers keep their
+    // original relative order — ground stains < ground decor < bench/dumpster <
+    // vehicles < trees < lamps — so the visible layering is unchanged.
     match kind {
-        Blood | Debris | Oil | Crater => -13.0,
-        Bush | HedgeH | HedgeV | Trash | Mailbox | Sign | Planter | Pallet
-        | Crate | Barrels | BodyBag | Gurney | SandbagH | SandbagV | RazorH
-        | RazorV | Flag => -1.5,
-        Bench | Dumpster => -1.2,
-        Car | Wreck | Bus | Truck | Ambulance | MilTruck | Jeep | Container
-        | Crane | Forklift | Playground => -1.0,
+        // Ground stains (~-13).
+        Blood => -13.00,
+        Debris => -12.99,
+        Oil => -12.98,
+        Crater => -12.97,
+        // Ground decor (~-1.5), spread across (-1.59, -1.42].
+        Bush => -1.58,
+        HedgeH => -1.57,
+        HedgeV => -1.56,
+        Trash => -1.55,
+        Mailbox => -1.54,
+        Sign => -1.53,
+        Planter => -1.52,
+        Pallet => -1.51,
+        Crate => -1.50,
+        Barrels => -1.49,
+        BodyBag => -1.48,
+        Gurney => -1.47,
+        SandbagH => -1.46,
+        SandbagV => -1.45,
+        RazorH => -1.44,
+        RazorV => -1.43,
+        Flag => -1.42,
+        // Mid layer (~-1.2).
+        Bench => -1.20,
+        Dumpster => -1.19,
+        // Vehicles / large props (~-1.0), spread across (-1.10, -1.00].
+        Car => -1.10,
+        Wreck => -1.09,
+        Bus => -1.08,
+        Truck => -1.07,
+        Ambulance => -1.06,
+        MilTruck => -1.05,
+        Jeep => -1.04,
+        Container => -1.03,
+        Crane => -1.02,
+        Forklift => -1.01,
+        Playground => -1.00,
         Tree => -0.6,
         Lamp => -0.4,
     }
