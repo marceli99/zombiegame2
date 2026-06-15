@@ -327,10 +327,11 @@ fn accumulate_camera_shake(
     }
 }
 
-/// Android entry point.  `#[bevy_main]` generates the `android_main` symbol the
-/// NDK's NativeActivity calls into; compiled only for Android, so the desktop
-/// binary (`src/main.rs`) drives `run()` directly instead.
-#[cfg(target_os = "android")]
+/// Mobile entry point.  `#[bevy_main]` generates the platform glue the OS calls
+/// into — `android_main` (NDK NativeActivity) on Android and the C-callable
+/// `main_rs` (invoked from `ios/main.m`) on iOS.  Compiled only for those
+/// targets; on desktop the binary (`src/main.rs`) drives `run()` directly.
+#[cfg(any(target_os = "android", target_os = "ios"))]
 #[bevy_main]
 fn main() {
     run();

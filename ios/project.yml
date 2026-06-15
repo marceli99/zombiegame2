@@ -1,0 +1,63 @@
+# XcodeGen spec — run `xcodegen generate` (in this folder) on a Mac to produce
+# ZombieGame.xcodeproj.  Keeps the Xcode project as readable text in git
+# instead of an opaque .pbxproj.  See README.md for the full flow.
+name: ZombieGame
+
+options:
+  bundleIdPrefix: org.zombiegame2
+  deploymentTarget:
+    iOS: "13.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    ENABLE_BITCODE: NO
+    # Xcode 15+ sandboxes "Run Script" phases; our pre-build script shells out
+    # to cargo and writes ios/lib, so it must be allowed to.
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+targets:
+  ZombieGame:
+    type: application
+    platform: iOS
+    deploymentTarget: "13.0"
+    sources:
+      - path: main.m
+      # Folder reference: the whole assets tree is copied into the .app as
+      # `assets/`, which is where Bevy's iOS AssetServer looks.
+      - path: ../assets
+        type: folder
+        buildPhase: resources
+    info:
+      path: Info.plist
+    settings:
+      base:
+        PRODUCT_NAME: ZombieGame
+        PRODUCT_BUNDLE_IDENTIFIER: org.zombiegame2.game
+        ONLY_ACTIVE_ARCH: YES
+        ENABLE_BITCODE: NO
+        # Link the Rust static library staged by build-rust.sh.
+        LIBRARY_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/lib
+        OTHER_LDFLAGS:
+          - $(inherited)
+          - -lzombiegame2
+          - -lc++
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: UIKit.framework
+      - sdk: QuartzCore.framework
+      - sdk: CoreGraphics.framework
+      - sdk: Foundation.framework
+      - sdk: AVFoundation.framework
+      - sdk: AudioToolbox.framework
+      - sdk: CoreAudio.framework
+      - sdk: GameController.framework
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+    preBuildScripts:
+      - path: build-rust.sh
+        name: "Build Rust static library"
+        basedOnDependencyAnalysis: false

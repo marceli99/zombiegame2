@@ -3,12 +3,18 @@ name = "zombiegame2"
 version = "0.1.0"
 edition = "2021"
 
-# The whole game is a library so the same code builds as a desktop binary and
-# an Android cdylib (NativeActivity via `#[bevy_main]` -> `android_main`); the
-# desktop binary (`src/main.rs`) links the rlib and just calls `run()`.
+# The whole game is a library so the same code can be built for every target:
+#   rlib      -> linked by the desktop binary (`src/main.rs`)
+#   cdylib    -> Android NativeActivity (`#[bevy_main]` -> `android_main`)
+#   staticlib -> iOS app bundle (`#[bevy_main]` -> `main_rs`, linked by Xcode)
 [lib]
 name = "zombiegame2"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[features]
+# Enable when building for the iOS *simulator* (`aarch64-apple-ios-sim` /
+# `x86_64-apple-ios`); `ios/build-rust.sh` passes this automatically.
+ios_sim = ["bevy/ios_simulator"]
 
 [dependencies]
 bevy = "0.14"
