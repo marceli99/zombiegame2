@@ -1172,9 +1172,16 @@ fn animate_segment_fog(
     mut q: Query<(&SegmentFog, &mut Sprite, &mut Transform)>,
 ) {
     let t = time.elapsed_seconds();
+    // Keep the fog opaque on mobile (see spawn_segment_fog_and_gates) so it
+    // stays a single non-blended layer; desktop breathes its alpha.
+    let lean = cfg!(any(target_os = "android", target_os = "ios"));
     for (fog, mut sprite, mut transform) in &mut q {
         let phase = fog.idx as f32 * 1.37;
-        let breathe = 0.78 + (t * 0.55 + phase).sin() * 0.07;
+        let breathe = if lean {
+            1.0
+        } else {
+            0.78 + (t * 0.55 + phase).sin() * 0.07
+        };
         sprite.color.set_alpha(breathe);
         // Tiny x/y drift gives the cloud cover a sense of movement.
         let origin_x = -MAP_WIDTH * 0.5
@@ -1845,28 +1852,45 @@ fn spawn_map(
     // navy at ~38% strength) and a lighter mottled "stormcloud" mask on
     // top with subtle vignetting at the edges.  Together they read as a
     // proper post-apocalyptic stormy afternoon.
-    let overcast_tex = images.add(build_overcast_image());
-    commands.spawn(SpriteBundle {
-        texture: overcast_tex.clone(),
-        sprite: Sprite {
-            custom_size: Some(Vec2::new(MAP_WIDTH, MAP_HEIGHT)),
-            color: Color::srgba(0.10, 0.12, 0.18, 0.38),
+    // On mobile, collapse the two stacked full-screen overlays into ONE
+    // pre-blended quad — two full-viewport alpha blends per frame are a top
+    // fill-rate cost on tiled, bandwidth-bound mobile GPUs.  Desktop keeps the
+    // exact two-layer look (overdraw is free on a dGPU).
+    if cfg!(any(target_os = "android", target_os = "ios")) {
+        let atmo_tex = images.add(build_overcast_composite_image());
+        commands.spawn(SpriteBundle {
+            texture: atmo_tex,
+            sprite: Sprite {
+                custom_size: Some(Vec2::new(MAP_WIDTH, MAP_HEIGHT)),
+                ..default()
+            },
+            transform: Transform::from_xyz(0.0, 0.0, 20.0),
             ..default()
-        },
-        transform: Transform::from_xyz(0.0, 0.0, 20.0),
-        ..default()
-    });
-    let storm_tex = images.add(build_stormcloud_image());
-    commands.spawn(SpriteBundle {
-        texture: storm_tex,
-        sprite: Sprite {
-            custom_size: Some(Vec2::new(MAP_WIDTH, MAP_HEIGHT)),
-            color: Color::srgba(0.18, 0.20, 0.26, 0.32),
+        });
+    } else {
+        let overcast_tex = images.add(build_overcast_image());
+        commands.spawn(SpriteBundle {
+            texture: overcast_tex,
+            sprite: Sprite {
+                custom_size: Some(Vec2::new(MAP_WIDTH, MAP_HEIGHT)),
+                color: Color::srgba(0.10, 0.12, 0.18, 0.38),
+                ..default()
+            },
+            transform: Transform::from_xyz(0.0, 0.0, 20.0),
             ..default()
-        },
-        transform: Transform::from_xyz(0.0, 0.0, 20.5),
-        ..default()
-    });
+        });
+        let storm_tex = images.add(build_stormcloud_image());
+        commands.spawn(SpriteBundle {
+            texture: storm_tex,
+            sprite: Sprite {
+                custom_size: Some(Vec2::new(MAP_WIDTH, MAP_HEIGHT)),
+                color: Color::srgba(0.18, 0.20, 0.26, 0.32),
+                ..default()
+            },
+            transform: Transform::from_xyz(0.0, 0.0, 20.5),
+            ..default()
+        });
+    }
 
     // Build the spatial-grid index now that every obstacle is in place.
     // Subsequent shape→Circle(0.0) transitions (toggle floor/roof, destroyed
@@ -1922,6 +1946,50 @@ fn build_overcast_image() -> Image {
     c.into_image()
 }
 
+/// Mobile-only: pre-blend the overcast tint + stormcloud mask into ONE texture
+/// so the atmosphere is a single full-map quad instead of two stacked
+/// alpha-blended ones.  Collapses the two "over" blends — overcast (a1=0.38)
+/// then stormcloud (a2=0.32) — into a single source: constant alpha `ac` and
+/// the colour back-premultiplied by `ac`, which reproduces the two-layer blend.
+fn build_overcast_composite_image() -> Image {
+    const A1: f32 = 0.38;
+    const A2: f32 = 0.32;
+    let ac = 1.0 - (1.0 - A1) * (1.0 - A2); // 0.5784
+    let tint1 = [0.10f32, 0.12, 0.18];
+    let tint2 = [0.18f32, 0.20, 0.26];
+    let mut c = Canvas::new(128, 128);
+    for y in 0..128i32 {
+        for x in 0..128i32 {
+            // Overcast source is 64x64; both layers stretch across the whole map,
+            // so sample it at (x/2, y/2) to keep the UVs aligned.
+            let (ox, oy) = (x / 2, y / 2);
+            let n1 = (ox * 7 + oy * 11) % 9;
+            let v1 = (180 + n1 * 4) as f32;
+            let layer1 = [v1, v1, (v1 + 8.0).min(255.0)];
+            // Stormcloud source (128x128): base noise + heavy circular patches.
+            let n = (x * 5 + y * 7) % 13 + (x * 11 + y * 3) % 17;
+            let base = (140 + n * 4 - 30).clamp(80, 220) as f32;
+            let mut layer2 = [base, base, (base + 12.0).min(255.0)];
+            for (cx, cy, r) in [(24i32, 30i32, 18i32), (80, 22, 24), (40, 100, 22), (104, 96, 20), (62, 64, 28)] {
+                let (dx, dy) = (x - cx, y - cy);
+                if dx * dx + dy * dy <= r * r {
+                    layer2 = [40.0, 44.0, 56.0];
+                }
+            }
+            let mut px = [0u8; 4];
+            for ch in 0..3 {
+                let c1 = layer1[ch] / 255.0 * tint1[ch];
+                let c2 = layer2[ch] / 255.0 * tint2[ch];
+                let acc = c1 * A1 * (1.0 - A2) + c2 * A2;
+                px[ch] = (acc / ac * 255.0).round().clamp(0.0, 255.0) as u8;
+            }
+            px[3] = (ac * 255.0).round() as u8;
+            c.put(x, y, px);
+        }
+    }
+    c.into_image()
+}
+
 fn spawn_segment_fog_and_gates(
     commands: &mut Commands,
     images: &mut ResMut<Assets<Image>>,
@@ -1936,12 +2004,21 @@ fn spawn_segment_fog_and_gates(
         }
         let origin_x = -MAP_WIDTH * 0.5 + segment_origin_x(seg.id) as f32 * TILE_SIZE
             + SEG_WIDTH * 0.5;
+        // A locked-segment fog quad can cover the whole viewport at a frontier —
+        // a third full-screen blend layer.  On mobile render it opaque (it
+        // already reads as a near-solid grey wall at 0.78) so a tiled GPU skips
+        // that blend; desktop keeps the translucent look.
+        let fog_alpha = if cfg!(any(target_os = "android", target_os = "ios")) {
+            1.0
+        } else {
+            0.78
+        };
         commands.spawn((
             SpriteBundle {
                 texture: fog_tex.clone(),
                 sprite: Sprite {
                     custom_size: Some(Vec2::new(SEG_WIDTH, MAP_HEIGHT)),
-                    color: Color::srgba(0.18, 0.19, 0.20, 0.78),
+                    color: Color::srgba(0.18, 0.19, 0.20, fog_alpha),
                     ..default()
                 },
                 transform: Transform::from_xyz(origin_x, 0.0, SEGMENT_FOG_Z),
