@@ -246,7 +246,9 @@ impl Plugin for ZombiePlugin {
                     spawn_score_popups,
                     drip_wounded_blood,
                 )
-                    .run_if(in_state(GameState::Playing)),
+                    // Cosmetic / feedback only — freeze on a singleplayer pause
+                    // (no blood/number/flash churn while paused); live in MP.
+                    .run_if(gameplay_active),
             );
     }
 }

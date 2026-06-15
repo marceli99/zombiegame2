@@ -401,7 +401,9 @@ impl Plugin for BulletPlugin {
                     spawn_ambient_embers,
                     update_ambient_embers,
                 )
-                    .run_if(in_state(GameState::Playing)),
+                    // Cosmetic FX — freeze on a singleplayer pause (no spawn/anim
+                    // churn while paused); stays live in multiplayer.
+                    .run_if(gameplay_active),
             )
             .add_systems(
                 FixedUpdate,

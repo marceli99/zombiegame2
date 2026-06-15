@@ -1134,7 +1134,11 @@ impl Plugin for MapPlugin {
                     animate_lamp_flicker,
                     animate_window_glow,
                 )
-                    .run_if(in_state(GameState::Playing)),
+                    // Purely cosmetic — freeze during a singleplayer pause so the
+                    // phone isn't churning hundreds of sprite mutations while the
+                    // player has deliberately stopped.  `gameplay_active` stays
+                    // true in multiplayer (the world never pauses there).
+                    .run_if(gameplay_active),
             )
             .add_systems(
                 FixedUpdate,
