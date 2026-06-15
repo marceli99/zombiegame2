@@ -4,3 +4,4 @@ ios/lib/
 ios/build/
 ios/DerivedData/
 ios/*.xcodeproj/
+.DS_Store
