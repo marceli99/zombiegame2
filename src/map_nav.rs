@@ -9,14 +9,30 @@ use bevy::prelude::*;
 use std::collections::{HashMap, VecDeque};
 
 use crate::map::{
-    in_bounds, is_walkable_tile, nav_idx, world_to_tile, MAP_COLS, MAP_ROWS,
+    in_bounds, is_walkable_tile, nav_idx, tile_center, world_to_tile, MapObstacles, MAP_COLS,
+    MAP_ROWS,
 };
 
 #[derive(Resource)]
 pub struct NavGrid {
+    /// Static walkability from building/perimeter wall rects only — never
+    /// changes after startup.
     pub walkable: Vec<bool>,
+    /// `walkable` minus tiles blocked by `MapObstacles` entries (trees,
+    /// props, wrecks, gates…), kept fresh by `refresh_nav_blocked`.  This is
+    /// what BFS flow fields and spawn snapping consume, so zombie paths
+    /// route *around* props instead of ramming them and relying on local
+    /// steering to recover.
+    pub effective: Vec<bool>,
     pub player_flow: HashMap<u8, Vec<u16>>,
     pub player_flow_tile: HashMap<u8, (i32, i32)>,
+    /// Obstacles changed since the last `effective` bake.
+    bake_pending: bool,
+    /// Seconds until the next bake is allowed (debounce).  Lives here (not
+    /// in a `Local`) so `expedite_nav_bake` can zero it on session entry —
+    /// a leftover cooldown from the previous session must not delay baking
+    /// the OnEnter obstacle resets (respawned wrecks, re-locked gates).
+    bake_cooldown: f32,
 }
 
 impl Default for NavGrid {
@@ -29,11 +45,66 @@ impl Default for NavGrid {
             }
         }
         Self {
+            effective: walkable.clone(),
             walkable,
             player_flow: HashMap::new(),
             player_flow_tile: HashMap::new(),
+            bake_pending: false,
+            bake_cooldown: 0.0,
         }
     }
+}
+
+/// OnEnter(Playing): drop any leftover debounce so the session's first
+/// `refresh_nav_blocked` run bakes the freshly reset obstacles immediately.
+pub fn expedite_nav_bake(mut nav: ResMut<NavGrid>) {
+    nav.bake_cooldown = 0.0;
+}
+
+/// Clearance radius (world px) used when baking `MapObstacles` into the nav
+/// grid: a tile is blocked when an obstacle overlaps a circle of this radius
+/// at the tile centre.  Matches the Normal-zombie radius — bigger kinds
+/// (Giant, r=20) may still get flow through gaps they can't fit and fall
+/// back to local steering there, which is the pre-existing behavior.
+pub const NAV_OBSTACLE_CLEARANCE: f32 = 10.0;
+
+/// Minimum seconds between `effective`-mask recomputes.  Obstacle mutations
+/// can cluster (e.g. every bullet chipping a wreck flags the resource), and
+/// one full pass is ~12k grid queries — debouncing keeps that off the
+/// per-frame budget while nav still reacts to a destroyed wreck or an
+/// unlocked gate well within human reaction time.
+const NAV_REFRESH_COOLDOWN: f32 = 0.35;
+
+/// Re-bakes `NavGrid::effective` whenever `MapObstacles` changed, then
+/// invalidates the cached per-player flow tiles so `update_nav_flow`
+/// rebuilds its BFS fields against the new mask on its next run.
+pub fn refresh_nav_blocked(
+    time: Res<Time>,
+    obstacles: Res<MapObstacles>,
+    mut nav: ResMut<NavGrid>,
+) {
+    let nav = &mut *nav;
+    if obstacles.is_changed() {
+        nav.bake_pending = true;
+    }
+    nav.bake_cooldown = (nav.bake_cooldown - time.delta_seconds()).max(0.0);
+    if !nav.bake_pending || nav.bake_cooldown > 0.0 {
+        return;
+    }
+    nav.bake_pending = false;
+    nav.bake_cooldown = NAV_REFRESH_COOLDOWN;
+
+    for row in 0..MAP_ROWS {
+        for col in 0..MAP_COLS {
+            let i = nav_idx(col, row);
+            nav.effective[i] = nav.walkable[i]
+                && !obstacles.hits(tile_center(col, row), NAV_OBSTACLE_CLEARANCE);
+        }
+    }
+    // Stale flow fields stay usable for the frames until their rebuild —
+    // only the tile cache is cleared so every alive player's field is
+    // recomputed on the next `update_nav_flow` pass.
+    nav.player_flow_tile.clear();
 }
 
 /// Maximum BFS radius (in tiles) for the per-player flow field.  60 tiles

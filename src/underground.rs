@@ -89,7 +89,17 @@ fn spawn_underground(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
     mut obstacles: ResMut<MapObstacles>,
+    mut obstacles_registered: Local<bool>,
 ) {
+    // The underground layout is static, but this system re-runs on every
+    // OnEnter(Playing).  Register the collision obstacles only on the first
+    // run — re-pushing them each session would append duplicates to
+    // `MapObstacles` (and shift the obstacle indices `DestroyedExplodables`
+    // ships over the wire).  Sprites are still spawned per session since
+    // `despawn_underground` removes them on exit.
+    let register_obstacles = !*obstacles_registered;
+    *obstacles_registered = true;
+
     // Floor — single big sprite for the whole bounding rect.  Tile texture
     // looks like a metro station floor (concrete slabs).
     let floor_tex = images.add(build_floor_tile_image());
@@ -141,7 +151,7 @@ fn spawn_underground(
     // Outer perimeter walls (4 rectangles).  Each is `WALL_THICK` thick
     // sitting just inside the bounding rect so the visible floor reaches
     // exactly to the wall.
-    push_perimeter_walls(&mut commands, &mut images, &mut obstacles);
+    push_perimeter_walls(&mut commands, &mut images, &mut obstacles, register_obstacles);
 
     // Pillars along the platform — periodic columns supporting the
     // ceiling.  Every 800 px, 3 pillars total.
@@ -164,11 +174,13 @@ fn spawn_underground(
             },
             UndergroundEntity,
         ));
-        let half = Vec2::new(18.0, 22.0);
-        obstacles.list.push(Obstacle {
-            pos: Vec2::new(x, y),
-            shape: ObstacleShape::Rect(half),
-        });
+        if register_obstacles {
+            let half = Vec2::new(18.0, 22.0);
+            obstacles.list.push(Obstacle {
+                pos: Vec2::new(x, y),
+                shape: ObstacleShape::Rect(half),
+            });
+        }
     }
 
     // Benches on the platform — clusters of two between pillars.
@@ -192,10 +204,12 @@ fn spawn_underground(
                 },
                 UndergroundEntity,
             ));
-            obstacles.list.push(Obstacle {
-                pos: Vec2::new(x + off, y),
-                shape: ObstacleShape::Rect(Vec2::new(24.0, 7.0)),
-            });
+            if register_obstacles {
+                obstacles.list.push(Obstacle {
+                    pos: Vec2::new(x + off, y),
+                    shape: ObstacleShape::Rect(Vec2::new(24.0, 7.0)),
+                });
+            }
         }
     }
 
@@ -214,10 +228,12 @@ fn spawn_underground(
         },
         UndergroundEntity,
     ));
-    obstacles.list.push(Obstacle {
-        pos: train_pos,
-        shape: ObstacleShape::Rect(Vec2::new(440.0, 60.0)),
-    });
+    if register_obstacles {
+        obstacles.list.push(Obstacle {
+            pos: train_pos,
+            shape: ObstacleShape::Rect(Vec2::new(440.0, 60.0)),
+        });
+    }
 
     // Vending machine & ticket booth on the eastern platform.
     let vendor_tex = images.add(build_vendor_image());
@@ -234,10 +250,12 @@ fn spawn_underground(
         },
         UndergroundEntity,
     ));
-    obstacles.list.push(Obstacle {
-        pos: vendor_pos,
-        shape: ObstacleShape::Rect(Vec2::new(20.0, 26.0)),
-    });
+    if register_obstacles {
+        obstacles.list.push(Obstacle {
+            pos: vendor_pos,
+            shape: ObstacleShape::Rect(Vec2::new(20.0, 26.0)),
+        });
+    }
 
     // Subway exit stairs on the east end.
     let exit_tex = images.add(build_exit_stairs_image());
@@ -276,21 +294,24 @@ fn spawn_underground(
     // can't wander down into the empty void above the metro.  The wall
     // spans the full map width with no gaps; zombies still spawn inside
     // the surface (at +1.5 tiles inward) so this doesn't affect spawning.
-    let surface_floor_y = -crate::map::MAP_HEIGHT * 0.5 - 32.0;
-    obstacles.list.push(Obstacle {
-        pos: Vec2::new(0.0, surface_floor_y),
-        shape: ObstacleShape::Rect(Vec2::new(crate::map::MAP_WIDTH * 0.5, 16.0)),
-    });
+    if register_obstacles {
+        let surface_floor_y = -crate::map::MAP_HEIGHT * 0.5 - 32.0;
+        obstacles.list.push(Obstacle {
+            pos: Vec2::new(0.0, surface_floor_y),
+            shape: ObstacleShape::Rect(Vec2::new(crate::map::MAP_WIDTH * 0.5, 16.0)),
+        });
 
-    // Bookkeeping: rebuild the spatial grid now that all underground
-    // obstacles have been pushed.
-    obstacles.rebuild_grid();
+        // Bookkeeping: rebuild the spatial grid now that all underground
+        // obstacles have been pushed.
+        obstacles.rebuild_grid();
+    }
 }
 
 fn push_perimeter_walls(
     commands: &mut Commands,
     images: &mut ResMut<Assets<Image>>,
     obstacles: &mut ResMut<MapObstacles>,
+    register_obstacles: bool,
 ) {
     let wall_tex = images.add(build_wall_image());
     // Overlap horizontal and vertical walls at the corners by `WALL_THICK`
@@ -355,11 +376,13 @@ fn push_perimeter_walls(
             UndergroundEntity,
         ));
     }
-    for (pos, half) in segments {
-        obstacles.list.push(Obstacle {
-            pos,
-            shape: ObstacleShape::Rect(half),
-        });
+    if register_obstacles {
+        for (pos, half) in segments {
+            obstacles.list.push(Obstacle {
+                pos,
+                shape: ObstacleShape::Rect(half),
+            });
+        }
     }
 }
 

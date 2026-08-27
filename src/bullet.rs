@@ -3,7 +3,8 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::audio::SfxEvent;
 use crate::map::{
-    DestroyedExplodables, Explodable, ExplodableObstacleIdx, MapObstacles, ObstacleShape,
+    DestroyedExplodables, Explodable, ExplodableObstacleIdx, ExplodableSmolder, MapObstacles,
+    ObstacleShape,
 };
 use crate::net::{is_authoritative, NetContext, NetEntities, NetId};
 use crate::pixelart::{Canvas, Rgba};
@@ -259,6 +260,17 @@ pub struct SmokeCloud {
     pub radius: f32,
 }
 
+/// Timed movement debuff applied by smoke clouds.  Holds the zombie's
+/// original (per-spawn jittered) speed so `expire_smoke_slow` can restore
+/// it exactly when the debuff runs out; `remaining` is refreshed every tick
+/// the zombie stays inside a cloud, so full speed comes back shortly after
+/// it walks out or the cloud fades.
+#[derive(Component)]
+pub struct SmokeSlowed {
+    pub base_speed: f32,
+    pub remaining: f32,
+}
+
 #[derive(Component)]
 pub struct FirePool {
     pub lifetime: f32,
@@ -271,6 +283,11 @@ pub const GRENADE_ZOMBIE_DAMAGE: i32 = 15;
 pub const GRENADE_PLAYER_DAMAGE: i32 = 25;
 pub const SMOKE_RADIUS: f32 = 90.0;
 pub const SMOKE_DURATION: f32 = 5.0;
+pub const SMOKE_SLOW_FACTOR: f32 = 0.3;
+/// How long the smoke slow lingers after the last tick spent inside a
+/// cloud.  Comfortably longer than one 60 Hz tick so the debuff never
+/// flickers off while the zombie is still standing in the smoke.
+pub const SMOKE_SLOW_LINGER: f32 = 0.25;
 pub const FIRE_RADIUS: f32 = 65.0;
 pub const FIRE_DURATION: f32 = 4.0;
 pub const FIRE_DAMAGE: i32 = 3;
@@ -400,6 +417,7 @@ impl Plugin for BulletPlugin {
                     update_bullet_shells,
                     spawn_ambient_embers,
                     update_ambient_embers,
+                    animate_explodable_smolder,
                 )
                     // Cosmetic FX — freeze on a singleplayer pause (no spawn/anim
                     // churn while paused); stays live in multiplayer.
@@ -417,6 +435,7 @@ impl Plugin for BulletPlugin {
                     explode_listener,
                     explosion_lifetime,
                     smoke_cloud_update,
+                    expire_smoke_slow,
                     fire_pool_update,
                 )
                     .chain()
@@ -709,7 +728,13 @@ fn shoot_listener(
     assets: Res<BulletAssets>,
     mut ctx: ResMut<NetContext>,
     zombies: Query<(Entity, &Transform), With<Zombie>>,
+    // Shooters that already got their once-per-trigger-pull cosmetics this
+    // tick.  Multi-pellet weapons emit one ShootEvent per pellet in a single
+    // tick; without the dedupe a SawedOff pull stacks 8 identical muzzle
+    // flashes at one origin (pure overdraw) and ejects 8 brass shells.
+    mut flashed: Local<Vec<u8>>,
 ) {
+    flashed.clear();
     for ev in events.read() {
         let net_id = ctx.alloc_bullet_id();
         // For homing rockets, lock the closest zombie at fire time so the
@@ -735,18 +760,29 @@ fn shoot_listener(
             ev.is_flame,
             ev.shooter_id,
         );
+        // First event this shooter fired this tick == first pellet of the
+        // trigger pull.  Tracers stay per-pellet — they fan out with spread
+        // and are what makes the pellet cone readable — but the shell and
+        // muzzle flash spawn once per pull.
+        let first_pellet = !flashed.contains(&ev.shooter_id);
+        if first_pellet {
+            flashed.push(ev.shooter_id);
+        }
+
         // Cheap glowing tracer streak from origin in the direction of fire.
         // Skipped for rockets and flames (they have their own bigger
         // visuals).
         if !ev.is_rocket && !ev.is_flame {
             spawn_bullet_tracer(&mut commands, &assets, ev.origin, ev.direction);
-            spawn_bullet_shell(&mut commands, &assets, ev.origin, ev.direction);
+            if first_pellet {
+                spawn_bullet_shell(&mut commands, &assets, ev.origin, ev.direction);
+            }
         }
 
         // Cosmetic muzzle flash at the gun tip.  Skip for flamethrower
         // since the flame puffs themselves are the visual.  Bigger for
         // rockets so the launch reads correctly even from a distance.
-        if ev.is_flame {
+        if ev.is_flame || !first_pellet {
             continue;
         }
         let angle = ev.direction.y.atan2(ev.direction.x);
@@ -984,6 +1020,13 @@ fn reset_rewind_buffer(mut rewind: ResMut<RewindBuffer>, mut grid: ResMut<Zombie
     grid.clear();
 }
 
+/// Minimum FixedUpdate ticks between two `SfxEvent::Hit` blips.  A shotgun
+/// blast consumes up to 8 pellets in a single tick and sustained flame fire
+/// lands ~80 hits/s; playing every one stacks identical tones into a volume
+/// spike and allocates an audio entity + `Pitch` asset per event.  Two ticks
+/// (~33 ms) keeps hits sounding continuous while capping the churn.
+const HIT_SFX_INTERVAL_TICKS: u8 = 2;
+
 #[allow(clippy::too_many_arguments)]
 fn bullet_collision(
     mut commands: Commands,
@@ -1000,14 +1043,19 @@ fn bullet_collision(
     mut destroyed: ResMut<DestroyedExplodables>,
     players: Query<&Player>,
     // Bundled into one tuple param to stay within Bevy's 16-param system limit.
-    (mut killed, mut explode, mut dmg_numbers, mut sfx): (
+    (mut killed, mut explode, mut dmg_numbers, mut sfx, mut hit_sfx_cooldown): (
         EventWriter<ZombieKilledEvent>,
         EventWriter<ExplodeEvent>,
         EventWriter<DamageNumberEvent>,
         EventWriter<SfxEvent>,
+        // Ticks left before the next Hit blip — see HIT_SFX_INTERVAL_TICKS.
+        Local<u8>,
     ),
     mut score: ResMut<Score>,
 ) {
+    if *hit_sfx_cooldown > 0 {
+        *hit_sfx_cooldown -= 1;
+    }
     let mult = max_money_mult(players.iter());
     let host_local_id = ctx.my_id;
     for (b_entity, b_transform, bullet) in &bullets {
@@ -1063,7 +1111,10 @@ fn bullet_collision(
                     amount: bullet.damage,
                 });
                 commands.entity(b_entity).despawn_recursive();
-                sfx.send(SfxEvent::Hit);
+                if *hit_sfx_cooldown == 0 {
+                    sfx.send(SfxEvent::Hit);
+                    *hit_sfx_cooldown = HIT_SFX_INTERVAL_TICKS;
+                }
                 if zombie.hp <= 0 {
                     let z_kind = zombie.kind;
                     let was_exploder = matches!(z_kind, ZombieKind::Exploder);
@@ -1127,7 +1178,10 @@ fn bullet_collision(
                     spawn_impact_sparks(&mut commands, &assets, bp, bullet.velocity);
                 }
                 commands.entity(b_entity).despawn_recursive();
-                sfx.send(SfxEvent::Hit);
+                if *hit_sfx_cooldown == 0 {
+                    sfx.send(SfxEvent::Hit);
+                    *hit_sfx_cooldown = HIT_SFX_INTERVAL_TICKS;
+                }
                 if expl.hp <= 0 {
                     if let Some(o) = obstacles.list.get_mut(obs_idx.0) {
                         o.shape = ObstacleShape::Circle(0.0);
@@ -1380,23 +1434,62 @@ fn smoke_cloud_update(
     mut commands: Commands,
     time: Res<Time>,
     mut clouds: Query<(Entity, &mut SmokeCloud, &Transform)>,
-    mut zombies: Query<(&Transform, &mut Zombie), Without<SmokeCloud>>,
+    mut zombies: Query<
+        (Entity, &Transform, &mut Zombie, Option<&mut SmokeSlowed>),
+        Without<SmokeCloud>,
+    >,
 ) {
     let dt = time.delta_seconds();
-    for (entity, mut cloud, cloud_t) in &mut clouds {
+    for (entity, mut cloud, _) in &mut clouds {
         cloud.lifetime -= dt;
         if cloud.lifetime <= 0.0 {
             commands.entity(entity).despawn_recursive();
+        }
+    }
+    if clouds.is_empty() {
+        return;
+    }
+    // Slow zombies inside a cloud.  The slow is a refreshed timed debuff —
+    // `expire_smoke_slow` hands the stored original speed back once the
+    // zombie has been outside every cloud for `SMOKE_SLOW_LINGER` seconds —
+    // rather than a permanent overwrite of the stat.
+    for (z_entity, zt, mut zombie, slow) in &mut zombies {
+        let zp = zt.translation.truncate();
+        let inside = clouds.iter().any(|(_, cloud, cloud_t)| {
+            let r = cloud.radius + zombie.kind.radius();
+            cloud.lifetime > 0.0
+                && zp.distance_squared(cloud_t.translation.truncate()) < r * r
+        });
+        if !inside {
             continue;
         }
-        // Slow zombies inside the cloud
-        let cp = cloud_t.translation.truncate();
-        for (zt, mut zombie) in &mut zombies {
-            let zp = zt.translation.truncate();
-            let r = cloud.radius + zombie.kind.radius();
-            if zp.distance_squared(cp) < r * r {
-                zombie.speed = zombie.kind.base_speed() * 0.3;
-            }
+        if let Some(mut slow) = slow {
+            slow.remaining = SMOKE_SLOW_LINGER;
+        } else {
+            commands.entity(z_entity).insert(SmokeSlowed {
+                base_speed: zombie.speed,
+                remaining: SMOKE_SLOW_LINGER,
+            });
+            zombie.speed *= SMOKE_SLOW_FACTOR;
+        }
+    }
+}
+
+/// Counts down the smoke-cloud slow and restores the zombie's original
+/// speed (per-spawn jitter included) when it runs out.  Runs right after
+/// `smoke_cloud_update` in the tick, so a zombie still inside a cloud has
+/// its timer refreshed before it is ever decremented here.
+fn expire_smoke_slow(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut slowed: Query<(Entity, &mut Zombie, &mut SmokeSlowed)>,
+) {
+    let dt = time.delta_seconds();
+    for (entity, mut zombie, mut slow) in &mut slowed {
+        slow.remaining -= dt;
+        if slow.remaining <= 0.0 {
+            zombie.speed = slow.base_speed;
+            commands.entity(entity).remove::<SmokeSlowed>();
         }
     }
 }
@@ -1809,6 +1902,147 @@ pub fn spawn_smoke_column(
             },
         ));
     }
+}
+
+/// Per-system accumulators that pace smolder emission.  Smoke ticks slowly
+/// (a lazy plume); flame ticks fast (a lively flicker).  Held in one `Local`
+/// so the system stays a single param.
+#[derive(Default)]
+struct SmolderEmit {
+    smoke: f32,
+    flame: f32,
+}
+
+/// Wrecks farther than this from the camera skip smolder FX entirely —
+/// comfortably beyond the visible half-diagonal at any zoom, so on-screen
+/// plumes are never clipped while off-screen ones cost nothing.
+const SMOLDER_CULL_RADIUS: f32 = 800.0;
+
+/// Continuously emits the damage FX for every smoldering explodable: a rising
+/// smoke plume once a wreck is hurt (`stage >= 1`), plus licking flames once
+/// it's badly damaged and about to blow (`stage == 2`).  Runs on every machine
+/// — the host derives the stage from HP, clients read it off the snapshot, so
+/// the same wreck smokes and burns identically for everyone.
+fn animate_explodable_smolder(
+    mut commands: Commands,
+    time: Res<Time>,
+    assets: Res<BulletAssets>,
+    q: Query<(&Transform, &ExplodableSmolder)>,
+    cameras: Query<&Transform, With<Camera>>,
+    mut emit: Local<SmolderEmit>,
+) {
+    let dt = time.delta_seconds();
+    emit.smoke += dt;
+    emit.flame += dt;
+    // Smoke about 3×/s, flame about 8×/s — fast enough to read as a live fire
+    // without flooding the scene with sprites when several wrecks burn at once.
+    let do_smoke = emit.smoke >= 0.32;
+    let do_flame = emit.flame >= 0.12;
+    if do_smoke {
+        emit.smoke = 0.0;
+    }
+    if do_flame {
+        emit.flame = 0.0;
+    }
+    if !do_smoke && !do_flame {
+        return;
+    }
+    // The FX is per-machine cosmetic (stage syncs via snapshot), so cull to
+    // what this camera can see — damaged wrecks accumulate over a match and
+    // never heal, and off-screen plumes are pure spawn/animate/despawn
+    // churn.  Mirrors the ambient-ember cull above.
+    let Ok(cam) = cameras.get_single() else {
+        return;
+    };
+    let cam_pos = cam.translation.truncate();
+    for (t, sm) in &q {
+        if sm.stage == 0 {
+            continue;
+        }
+        let pos = t.translation.truncate();
+        if pos.distance_squared(cam_pos) > SMOLDER_CULL_RADIUS * SMOLDER_CULL_RADIUS {
+            continue;
+        }
+        if do_smoke {
+            spawn_damage_smoke(&mut commands, &assets, pos, sm.stage);
+        }
+        if do_flame && sm.stage >= 2 {
+            spawn_damage_flame(&mut commands, &assets, pos);
+        }
+    }
+}
+
+/// One rising smoke puff off a damaged wreck.  Darker and fatter once the
+/// wreck is burning (`stage == 2`) so the plume visibly thickens as it nears
+/// detonation.  Reuses the `SmokePuff` drift/grow/fade animation.
+fn spawn_damage_smoke(commands: &mut Commands, assets: &BulletAssets, pos: Vec2, stage: u8) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let burning = stage >= 2;
+    let dx = rng.gen_range(-11.0..11.0);
+    let start = if burning {
+        rng.gen_range(20.0..28.0)
+    } else {
+        rng.gen_range(12.0..18.0)
+    };
+    let end = start + rng.gen_range(30.0..46.0);
+    let life = rng.gen_range(1.1..1.7);
+    let vy = rng.gen_range(28.0..46.0);
+    let vx = rng.gen_range(-9.0..9.0);
+    // Sooty grey-brown; darker when actively on fire.
+    let tint = if burning { 0.26 } else { 0.42 };
+    commands.spawn((
+        SpriteBundle {
+            texture: assets.smoke.clone(),
+            sprite: Sprite {
+                custom_size: Some(Vec2::splat(start)),
+                color: Color::srgba(tint, tint * 0.95, tint * 0.9, 0.0),
+                ..default()
+            },
+            transform: Transform::from_xyz(pos.x + dx, pos.y + 6.0, 6.4),
+            ..default()
+        },
+        SmokePuff {
+            lifetime: life,
+            max_lifetime: life,
+            velocity: Vec2::new(vx, vy),
+            start_size: start,
+            end_size: end,
+        },
+    ));
+}
+
+/// One short-lived flame lick on a wreck that's about to explode.  Small,
+/// fast-rising, barely grows — reads as fire rather than smoke.  The warm
+/// tint catches the bloom pass on desktop for an extra glow.
+fn spawn_damage_flame(commands: &mut Commands, assets: &BulletAssets, pos: Vec2) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let dx = rng.gen_range(-10.0..10.0);
+    let dy = rng.gen_range(-4.0..4.0);
+    let size = rng.gen_range(16.0..26.0);
+    let life = rng.gen_range(0.34..0.55);
+    let vy = rng.gen_range(42.0..72.0);
+    let vx = rng.gen_range(-12.0..12.0);
+    commands.spawn((
+        SpriteBundle {
+            texture: assets.flame.clone(),
+            sprite: Sprite {
+                custom_size: Some(Vec2::splat(size)),
+                color: Color::srgba(1.0, 0.85, 0.5, 0.0),
+                ..default()
+            },
+            transform: Transform::from_xyz(pos.x + dx, pos.y + dy + 4.0, 6.6),
+            ..default()
+        },
+        SmokePuff {
+            lifetime: life,
+            max_lifetime: life,
+            velocity: Vec2::new(vx, vy),
+            start_size: size,
+            end_size: size * 1.15,
+        },
+    ));
 }
 
 fn update_bullet_shells(

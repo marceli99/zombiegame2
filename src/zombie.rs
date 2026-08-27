@@ -121,6 +121,25 @@ pub struct DamageNumber {
     pub velocity: Vec2,
 }
 
+/// Merge bookkeeping for a hit-damage popup: further hits landing near
+/// `spawn_pos` while the popup is still young are added into `total` (and
+/// the glyphs restyled) instead of spawning another overlapping number.
+/// Score popups reuse `DamageNumber` for their drift but deliberately don't
+/// carry this, so damage is never folded into a "+$N" label.
+#[derive(Component)]
+pub struct DamageNumberAccum {
+    pub total: i32,
+    pub spawn_pos: Vec2,
+}
+
+/// Hits within this radius of a popup's spawn point count as "the same
+/// zombie" for merging.
+const DAMAGE_MERGE_RADIUS_SQ: f32 = 24.0 * 24.0;
+/// A popup only absorbs new hits during its first fraction of a second —
+/// after that a fresh number spawns, so sustained fire reads as a slow
+/// series of climbing totals instead of 20-80 glyph spawns per second.
+const DAMAGE_MERGE_WINDOW: f32 = 0.3;
+
 /// Event raised on every successful hit so the FX system can spawn a
 /// floating number without each damage site needing to know about UI.
 #[derive(Event)]
@@ -222,6 +241,9 @@ impl Plugin for ZombiePlugin {
                 FixedUpdate,
                 (
                     spawn_zombie_listener,
+                    // Nav concern, but chained here: the obstacle overlay must
+                    // land before the BFS rebuild that consumes it.
+                    crate::map::refresh_nav_blocked,
                     update_nav_flow,
                     zombie_movement,
                     zombie_attack,
@@ -354,44 +376,89 @@ fn spawn_score_popups(
     }
 }
 
+/// Font size + tint tier for a damage total — bigger / brighter numbers for
+/// big damage, readable from far away.
+fn damage_number_style(amount: i32) -> (f32, Color) {
+    if amount >= 18 {
+        (18.0, Color::srgba(1.0, 0.85, 0.30, 1.0))
+    } else if amount >= 6 {
+        (14.0, Color::srgba(1.0, 0.95, 0.55, 1.0))
+    } else {
+        (12.0, Color::srgba(1.0, 1.0, 0.85, 0.95))
+    }
+}
+
 fn spawn_damage_numbers(
     mut commands: Commands,
     mut events: EventReader<DamageNumberEvent>,
     ui: Res<crate::UiAssets>,
+    mut live: Query<(&DamageNumber, &mut DamageNumberAccum, &mut Text)>,
 ) {
     use rand::Rng;
-    let mut rng = rand::thread_rng();
+    // Rapid-fire weapons land 20-80 hits/s; a Text2d spawn per hit is both
+    // unreadable glyph soup and real layout/entity churn on mobile.
+    // Coalesce instead: merge this frame's events by proximity first (a
+    // shotgun blast puts up to 8 pellets on one zombie in a single tick),
+    // then fold each merged hit into a nearby still-fresh popup so
+    // sustained fire updates one climbing number per zombie.
+    let mut clusters: Vec<(Vec2, i32)> = Vec::new();
     for ev in events.read() {
         if ev.amount <= 0 {
             continue;
         }
-        // Bigger / brighter numbers for big damage — readable from far away.
-        let (font_size, color) = if ev.amount >= 18 {
-            (18.0, Color::srgba(1.0, 0.85, 0.30, 1.0))
-        } else if ev.amount >= 6 {
-            (14.0, Color::srgba(1.0, 0.95, 0.55, 1.0))
-        } else {
-            (12.0, Color::srgba(1.0, 1.0, 0.85, 0.95))
-        };
+        match clusters
+            .iter_mut()
+            .find(|(p, _)| p.distance_squared(ev.pos) < DAMAGE_MERGE_RADIUS_SQ)
+        {
+            Some((_, total)) => *total += ev.amount,
+            None => clusters.push((ev.pos, ev.amount)),
+        }
+    }
+    if clusters.is_empty() {
+        return;
+    }
+    let mut rng = rand::thread_rng();
+    'clusters: for (pos, amount) in clusters {
+        for (dn, mut accum, mut text) in &mut live {
+            let age = dn.max_lifetime - dn.lifetime;
+            if age > DAMAGE_MERGE_WINDOW
+                || accum.spawn_pos.distance_squared(pos) >= DAMAGE_MERGE_RADIUS_SQ
+            {
+                continue;
+            }
+            accum.total += amount;
+            let (font_size, color) = damage_number_style(accum.total);
+            if let Some(sec) = text.sections.first_mut() {
+                sec.value = format!("{}", accum.total);
+                sec.style.font_size = font_size;
+                sec.style.color = color;
+            }
+            continue 'clusters;
+        }
+        let (font_size, color) = damage_number_style(amount);
         let lifetime = 0.7;
         let jitter = Vec2::new(rng.gen_range(-6.0..6.0), rng.gen_range(0.0..6.0));
         commands.spawn((
             Text2dBundle {
                 text: Text::from_section(
-                    format!("{}", ev.amount),
+                    format!("{}", amount),
                     TextStyle {
                         font: ui.font.clone(),
                         font_size,
                         color,
                     },
                 ),
-                transform: Transform::from_xyz(ev.pos.x + jitter.x, ev.pos.y + 14.0 + jitter.y, 9.8),
+                transform: Transform::from_xyz(pos.x + jitter.x, pos.y + 14.0 + jitter.y, 9.8),
                 ..default()
             },
             DamageNumber {
                 lifetime,
                 max_lifetime: lifetime,
                 velocity: Vec2::new(rng.gen_range(-30.0..30.0), 60.0),
+            },
+            DamageNumberAccum {
+                total: amount,
+                spawn_pos: pos,
             },
         ));
     }
@@ -1146,6 +1213,7 @@ pub fn spawn_zombie_entity(
                 hit_flash: 0.0,
                 bleed_timer: 0.0,
             },
+            ZombieNav::default(),
             NetId(net_id),
         ))
         .id();
@@ -1203,6 +1271,11 @@ fn spawn_zombie_listener(
     existing: Query<(), With<Zombie>>,
     players: Query<&Transform, With<Player>>,
 ) {
+    // Waves feed at most a few spawns per second while this runs at 60 Hz —
+    // skip the alive count and spawn-point Vec builds on event-less ticks.
+    if events.is_empty() {
+        return;
+    }
     let alive = existing.iter().count();
     let mut spawned = 0;
     let mut rng = rand::thread_rng();
@@ -1280,7 +1353,7 @@ fn spawn_zombie_listener(
         // Snap to the nearest walkable tile within a small radius if we landed
         // on something solid (a wall column, decor, etc.).
         let (c0, r0) = world_to_tile(pos);
-        if !(in_bounds(c0, r0) && nav.walkable[nav_idx(c0, r0)]) {
+        if !(in_bounds(c0, r0) && nav.effective[nav_idx(c0, r0)]) {
             'snap: for ring in 1_i32..=4 {
                 for dr in -ring..=ring {
                     for dc in -ring..=ring {
@@ -1288,7 +1361,7 @@ fn spawn_zombie_listener(
                             continue;
                         }
                         let (c, r) = (c0 + dc, r0 + dr);
-                        if in_bounds(c, r) && nav.walkable[nav_idx(c, r)] {
+                        if in_bounds(c, r) && nav.effective[nav_idx(c, r)] {
                             pos = tile_center(c, r);
                             break 'snap;
                         }
@@ -1341,14 +1414,14 @@ fn update_nav_flow(mut nav: ResMut<NavGrid>, players: Query<(&Transform, &Player
     }
 
     if !rebuilds.is_empty() {
-        // Run all BFS passes against the live `nav.walkable` slice (no
+        // Run all BFS passes against the live `nav.effective` slice (no
         // 11.5k-bool clone), then write the results back to the same nav
         // resource.  Split-borrowing field-by-field keeps the borrow checker
-        // happy: the borrow of `nav.walkable` and the mutation of
+        // happy: the borrow of `nav.effective` and the mutation of
         // `nav.player_flow` are on disjoint fields.
         let nav = &mut *nav;
         for (id, pos, tile) in rebuilds {
-            let field = bfs_distance_field(&nav.walkable, pos);
+            let field = bfs_distance_field(&nav.effective, pos);
             nav.player_flow.insert(id, field);
             nav.player_flow_tile.insert(id, tile);
         }
@@ -1378,12 +1451,16 @@ fn zombie_flow_direction(nav: &NavGrid, zombie_pos: Vec2, player_pos: Vec2) -> O
         return None;
     }
     let my_d = flow[nav_idx(zc, zr)];
-    if my_d == u16::MAX {
-        return None;
-    }
     if my_d == 0 {
         return Some((player_pos - zombie_pos).normalize_or_zero());
     }
+    // A zombie can legally stand in the outer band of a nav-blocked tile
+    // (the bake tests only the tile centre), where its own field entry reads
+    // MAX.  Recover by heading for the cheapest finite neighbour instead of
+    // bailing to the straight-line fallback, which happily aims through
+    // building walls; the diagonal corner-cut test is skipped here because
+    // it consults the (MAX) entries around the blocked tile.
+    let recovering = my_d == u16::MAX;
     let dirs: [(i32, i32); 8] = [
         (-1, 0), (1, 0), (0, -1), (0, 1),
         (-1, -1), (-1, 1), (1, -1), (1, 1),
@@ -1398,7 +1475,7 @@ fn zombie_flow_direction(nav: &NavGrid, zombie_pos: Vec2, player_pos: Vec2) -> O
         if d == u16::MAX {
             continue;
         }
-        if dc != 0 && dr != 0 {
+        if !recovering && dc != 0 && dr != 0 {
             let idx_a = nav_idx(zc + dc, zr);
             let idx_b = nav_idx(zc, zr + dr);
             if flow[idx_a] == u16::MAX || flow[idx_b] == u16::MAX {
@@ -1419,21 +1496,45 @@ fn rotate_vec(v: Vec2, angle: f32) -> Vec2 {
     Vec2::new(v.x * c - v.y * s, v.x * s + v.y * c)
 }
 
+/// Per-zombie local-steering state.  Host-side only (movement is
+/// authoritative there); never serialized.
+#[derive(Component, Default)]
+pub struct ZombieNav {
+    /// Detour side committed to while an obstacle blocks the desired
+    /// direction: +1.0 / -1.0, or 0.0 when the path ahead is clear.  Without
+    /// this the probe loop re-picks a side every frame and near-symmetric
+    /// setups (a tree dead ahead) make the zombie flip-flop in place.
+    avoid_sign: f32,
+    /// Seconds of consecutive near-zero forward progress.
+    stuck_time: f32,
+    /// While > 0, movement is committed to `escape_dir` regardless of the
+    /// flow field — breaks concave prop pockets the probe loop can't solve.
+    escape_timer: f32,
+    escape_dir: Vec2,
+    /// Consecutive escape triggers without real progress in between — after
+    /// two failed sideways tries the third backs straight out of the pocket.
+    escape_attempts: u8,
+}
+
+/// Returns the steered direction plus the detour sign it used (0.0 = went
+/// straight).  `prefer` biases the probe loop to re-try the previously
+/// chosen side first so a committed detour is stable frame-to-frame.
 fn steer_around_obstacles(
     pos: Vec2,
     desired: Vec2,
     obstacles: &MapObstacles,
     radius: f32,
-) -> Vec2 {
+    prefer: f32,
+) -> (Vec2, f32) {
     if desired == Vec2::ZERO {
-        return desired;
+        return (desired, 0.0);
     }
     let near = radius + 6.0;
     let far = radius + 22.0;
     if !obstacles.hits(pos + desired * near, radius)
         && !obstacles.hits(pos + desired * far, radius * 0.85)
     {
-        return desired;
+        return (desired, 0.0);
     }
     let angle_steps: [f32; 5] = [
         std::f32::consts::FRAC_PI_8,
@@ -1442,47 +1543,51 @@ fn steer_around_obstacles(
         std::f32::consts::FRAC_PI_2 + std::f32::consts::FRAC_PI_4,
         std::f32::consts::PI * 0.85,
     ];
-    let mut best: Option<(f32, Vec2)> = None;
+    let signs = if prefer < 0.0 {
+        [-1.0_f32, 1.0]
+    } else {
+        [1.0_f32, -1.0]
+    };
     for &mag in &angle_steps {
-        for sign in [1.0_f32, -1.0] {
-            let ang = sign * mag;
-            let alt = rotate_vec(desired, ang);
+        for sign in signs {
+            let alt = rotate_vec(desired, sign * mag);
             if obstacles.hits(pos + alt * near, radius) {
                 continue;
             }
             if obstacles.hits(pos + alt * far, radius * 0.85) {
                 continue;
             }
-            let score = mag;
-            if best.is_none_or(|(s, _)| score < s) {
-                best = Some((score, alt));
-            }
-        }
-        if best.is_some() {
-            break;
+            return (alt, sign);
         }
     }
-    if let Some((_, v)) = best {
-        return v;
-    }
-    for sign in [1.0_f32, -1.0] {
+    for sign in signs {
         let alt = rotate_vec(desired, sign * std::f32::consts::FRAC_PI_2);
         if !obstacles.hits(pos + alt * near, radius) {
-            return alt;
+            return (alt, sign);
         }
     }
-    desired
+    // Totally blocked: keep the caller's committed side (0.0 would erase it
+    // and make every stuck-watchdog escape re-roll a random side).
+    (desired, prefer)
 }
+
+/// Progress ratio (moved / expected) below which a tick counts as "stuck".
+const STUCK_PROGRESS_RATIO: f32 = 0.35;
+/// Consecutive stuck seconds before a committed sideways escape kicks in.
+const STUCK_TRIGGER_SECS: f32 = 0.5;
+/// How long a triggered escape stays committed.
+const ESCAPE_SECS: f32 = 0.45;
 
 fn zombie_movement(
     time: Res<Time>,
     obstacles: Res<MapObstacles>,
     nav: Res<NavGrid>,
-    mut zombies: Query<(&mut Transform, &Zombie), Without<Player>>,
+    mut zombies: Query<(&mut Transform, &Zombie, &mut ZombieNav), Without<Player>>,
     players: Query<(&Transform, &Player)>,
 ) {
     let dt = time.delta_seconds();
-    for (mut transform, zombie) in &mut zombies {
+    let mut rng = rand::thread_rng();
+    for (mut transform, zombie, mut znav) in &mut zombies {
         let pos = transform.translation.truncate();
         let radius = zombie.kind.radius();
 
@@ -1505,10 +1610,23 @@ fn zombie_movement(
 
         let flow = zombie_flow_direction(&nav, pos, target)
             .unwrap_or_else(|| (target - pos).normalize_or_zero());
-        let dir = steer_around_obstacles(pos, flow, &obstacles, radius);
+        let escaping = znav.escape_timer > 0.0;
+        let dir = if escaping {
+            znav.escape_timer -= dt;
+            znav.escape_dir
+        } else {
+            let (dir, sign) = steer_around_obstacles(pos, flow, &obstacles, radius, znav.avoid_sign);
+            znav.avoid_sign = sign;
+            dir
+        };
 
-        if dir != Vec2::ZERO {
-            transform.rotation = Quat::from_rotation_z(dir.y.atan2(dir.x));
+        // While escaping keep facing the flow direction — the escape is a
+        // sidestep, not a change of heart, and snapping the sprite ±90°/180°
+        // for half a second reads as twitching (snapshots ship it to clients
+        // too).
+        let facing = if escaping && flow != Vec2::ZERO { flow } else { dir };
+        if facing != Vec2::ZERO {
+            transform.rotation = Quat::from_rotation_z(facing.y.atan2(facing.x));
         }
         transform.translation += (dir * zombie.speed * dt).extend(0.0);
 
@@ -1516,6 +1634,65 @@ fn zombie_movement(
         obstacles.resolve(&mut new_pos, radius);
         transform.translation.x = new_pos.x;
         transform.translation.y = new_pos.y;
+
+        // Stuck watchdog: steering can still deadlock in concave prop
+        // pockets (probe passes, resolve cancels the motion, repeat).  When
+        // actual displacement stays far below `speed * dt` for a while,
+        // commit to a sideways escape for a few tenths of a second — long
+        // enough to clear the pocket and pick up a fresh flow direction.
+        // Escapes escalate: two sideways tries (alternating sides), then a
+        // longer straight back-out; real progress resets the ladder.
+        let expected = zombie.speed * dt;
+        if expected <= f32::EPSILON {
+            continue;
+        }
+        let progressing = new_pos.distance(pos) >= expected * STUCK_PROGRESS_RATIO;
+        if progressing {
+            znav.stuck_time = 0.0;
+            if !escaping {
+                znav.escape_attempts = 0;
+            }
+        } else if escaping {
+            // The committed escape is itself pinned (it was probed only one
+            // step ahead) — abort it early and flip the preferred side so
+            // the next attempt tries the other way instead of burning the
+            // rest of the commit window against the same prop.
+            znav.escape_timer = 0.0;
+            if znav.avoid_sign != 0.0 {
+                znav.avoid_sign = -znav.avoid_sign;
+            }
+            znav.stuck_time = STUCK_TRIGGER_SECS * 0.6;
+        } else {
+            znav.stuck_time += dt;
+        }
+        if znav.stuck_time >= STUCK_TRIGGER_SECS && znav.escape_timer <= 0.0 {
+            znav.stuck_time = 0.0;
+            znav.escape_attempts = znav.escape_attempts.saturating_add(1);
+            if znav.escape_attempts >= 3 {
+                znav.escape_dir = -flow;
+                znav.escape_timer = ESCAPE_SECS * 2.0;
+                znav.escape_attempts = 0;
+            } else {
+                let side = if znav.avoid_sign != 0.0 {
+                    znav.avoid_sign
+                } else if rng.gen_bool(0.5) {
+                    1.0
+                } else {
+                    -1.0
+                };
+                let probe = radius + 8.0;
+                let mut esc = rotate_vec(flow, side * std::f32::consts::FRAC_PI_2);
+                if obstacles.hits(new_pos + esc * probe, radius) {
+                    esc = rotate_vec(flow, -side * std::f32::consts::FRAC_PI_2);
+                }
+                if obstacles.hits(new_pos + esc * probe, radius) {
+                    esc = -flow;
+                }
+                znav.escape_dir = esc;
+                znav.escape_timer = ESCAPE_SECS;
+                znav.avoid_sign = side;
+            }
+        }
     }
 }
 

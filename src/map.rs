@@ -128,7 +128,7 @@ pub fn nav_idx(col: i32, row: i32) -> usize {
 // NavGrid + BFS distance fields live in `map_nav` (split out 2026-05-03).
 // Re-exported here so existing `use crate::map::{NavGrid, bfs_distance_field, ...}`
 // keeps working.
-pub use crate::map_nav::{bfs_distance_field, NavGrid};
+pub use crate::map_nav::{bfs_distance_field, expedite_nav_bake, refresh_nav_blocked, NavGrid};
 
 /// Tile is walkable when it doesn't overlap any wall rect.  This is the
 /// build-time predicate used by `NavGrid::default()` and `unlock_nav_rows`.
@@ -407,10 +407,40 @@ pub fn prop_world_center(p: &Prop) -> Vec2 {
 #[derive(Component, Debug, Clone, Copy)]
 pub struct Explodable {
     pub hp: i32,
+    /// Full HP at spawn — the denominator for `damage_stage`, so the smolder
+    /// FX reads as a fraction of the wreck's own toughness (a tanky bus and a
+    /// flimsy car both start smoking at the same *relative* damage).
+    pub max_hp: i32,
     pub radius: f32,
     pub player_damage: i32,
     pub zombie_damage: i32,
     pub kind: ExplodableVisualKind,
+}
+
+impl Explodable {
+    /// Visual damage tier from remaining HP: `0` = intact, `1` = smoking,
+    /// `2` = burning (on the brink of detonating).  Thresholds are picked so
+    /// most of a wreck's life it's clean, smokes through the mid band, then
+    /// visibly catches fire for the final third as a "stand back" tell.
+    pub fn damage_stage(&self) -> u8 {
+        let frac = self.hp as f32 / self.max_hp.max(1) as f32;
+        if frac > 0.6 {
+            0
+        } else if frac > 0.3 {
+            1
+        } else {
+            2
+        }
+    }
+}
+
+/// Current visual damage tier of an explodable, mirrored onto every machine so
+/// the smolder FX looks identical everywhere.  The host (and singleplayer)
+/// derives it from live HP in `refresh_explodable_smolder`; clients copy it
+/// straight from the snapshot's `damaged_explodables`.
+#[derive(Component, Default, Debug, Clone, Copy)]
+pub struct ExplodableSmolder {
+    pub stage: u8,
 }
 
 /// Stores the index in `MapObstacles.list` for an explodable's collision
@@ -426,6 +456,32 @@ pub struct ExplodableObstacleIdx(pub usize);
 #[derive(Resource, Default)]
 pub struct DestroyedExplodables {
     pub indices: std::collections::HashSet<u32>,
+}
+
+/// One respawnable explodable, captured at `spawn_map` time: everything
+/// `reset_explodables` needs to rebuild a pristine copy for a new session.
+struct ExplodableRespawnEntry {
+    texture: Handle<Image>,
+    sprite_size: Vec2,
+    pos: Vec2,
+    z: f32,
+    obstacle_idx: usize,
+    shape: ObstacleShape,
+    spec: Explodable,
+    /// Vehicle props carry `MapDecor`; ambient wrecks/barrels don't.
+    decor: bool,
+}
+
+/// Spawn-time table of every explodable — the ambient wrecks/barrels from
+/// `EXPLODABLES` and the destructible vehicle props.  `spawn_map` runs only
+/// at Startup, so a fresh session rebuilds them from this instead.  The
+/// `ExplodableObstacleIdx` values ship over the wire in
+/// `DestroyedExplodables`, so the respawn must reuse the exact same indices
+/// and restore each obstacle's shape IN PLACE rather than pushing fresh
+/// entries.
+#[derive(Resource, Default)]
+struct ExplodableRespawnTable {
+    entries: Vec<ExplodableRespawnEntry>,
 }
 
 /// Despawn any explodable whose obstacle index appears in
@@ -450,6 +506,19 @@ fn apply_destroyed_explodables(
             o.shape = ObstacleShape::Circle(0.0);
         }
         commands.entity(entity).despawn_recursive();
+    }
+}
+
+/// Host / singleplayer: keep each explodable's `ExplodableSmolder.stage` in
+/// step with its live HP.  This is the authoritative source the snapshot then
+/// ships to clients, and what the local smolder FX reads — so a wreck starts
+/// smoking, then burning, as gunfire chips it down toward detonation.
+fn refresh_explodable_smolder(mut q: Query<(&Explodable, &mut ExplodableSmolder)>) {
+    for (expl, mut sm) in &mut q {
+        let s = expl.damage_stage();
+        if sm.stage != s {
+            sm.stage = s;
+        }
     }
 }
 
@@ -525,6 +594,7 @@ impl ExplodableVisualKind {
         match self {
             ExplodableVisualKind::CarWreck => Explodable {
                 hp: 60,
+                max_hp: 60,
                 radius: 90.0,
                 player_damage: 35,
                 zombie_damage: 14,
@@ -532,6 +602,7 @@ impl ExplodableVisualKind {
             },
             ExplodableVisualKind::FuelBarrel => Explodable {
                 hp: 25,
+                max_hp: 25,
                 radius: 75.0,
                 player_damage: 30,
                 zombie_damage: 14,
@@ -576,6 +647,7 @@ pub fn vehicle_explodable_for(kind: PropKind) -> Option<Explodable> {
     };
     Some(Explodable {
         hp,
+        max_hp: hp,
         radius,
         player_damage,
         zombie_damage,
@@ -662,8 +734,10 @@ pub struct BuildingRoof {
 }
 
 /// Tags an entity as belonging to a specific floor of a specific building.
-/// `floor = 0` is the ground floor (default visibility); higher floors are
-/// shown only when the local player is on that floor of that building.
+/// `floor = 0` is the ground floor, shown only while the local player is in
+/// that building's footprint (outside, the opaque roof covers it — drawing
+/// the interior underneath would be pure overdraw); higher floors are shown
+/// only when the local player is on that floor of that building.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct FloorEntity {
     pub building: usize,
@@ -686,6 +760,19 @@ pub struct PlayerFloorState {
     pub building: Option<usize>,
     pub floor: u8,
 }
+
+/// Which building footprint the local player is standing in, if any — ALL
+/// buildings, not just multi-floor ones.  Kept separate from
+/// `PlayerFloorState` on purpose: that resource only tracks roof-access
+/// buildings because `check_roof_fall` / `staircase_interact` key off it
+/// (extending it to single-storey houses would turn stepping out of any
+/// house into a "roof fall").  Written by `update_building_roof_visibility`
+/// (which already runs the footprint test), read by the interior culling in
+/// `update_floor_entity_visibility` and the window-glow fade.  On exit it
+/// holds the old index until that roof has tweened back to opaque, so the
+/// interior never vanishes under a still-translucent roof.
+#[derive(Resource, Default, Clone, Copy, Debug)]
+pub struct LocalInsideBuilding(pub Option<usize>);
 
 /// Decrementing seconds-since-last-stair-use.  Stops the stand-on-staircase
 /// auto-trigger from cycling floors every tick; also bumped when the player
@@ -1105,10 +1192,17 @@ impl Plugin for MapPlugin {
             .init_resource::<BuildingWallIndices>()
             .init_resource::<FloorObstacleIndices>()
             .init_resource::<DestroyedExplodables>()
+            .init_resource::<LocalInsideBuilding>()
+            .init_resource::<ExplodableRespawnTable>()
             .add_systems(Startup, spawn_map)
             .add_systems(
                 OnEnter(GameState::Playing),
-                (reset_segment_state, reset_player_floor_state),
+                (
+                    reset_segment_state,
+                    reset_player_floor_state,
+                    reset_explodables,
+                    expedite_nav_bake,
+                ),
             )
             .add_systems(
                 Update,
@@ -1125,6 +1219,15 @@ impl Plugin for MapPlugin {
                 )
                     .chain()
                     .run_if(in_state(GameState::Playing)),
+            )
+            // Host/singleplayer only: derive the smolder stage from live HP.
+            // Clients get the stage off the wire instead (see sync.rs), so this
+            // must stay authoritative-gated or it would clobber their value.
+            .add_systems(
+                Update,
+                refresh_explodable_smolder
+                    .run_if(gameplay_active)
+                    .run_if(crate::net::is_authoritative),
             )
             .add_systems(
                 Update,
@@ -1183,21 +1286,43 @@ fn animate_segment_fog(
             0.78 + (t * 0.55 + phase).sin() * 0.07
         };
         sprite.color.set_alpha(breathe);
-        // Tiny x/y drift gives the cloud cover a sense of movement.
+        // Slow, gentle drift gives the cloud cover a sense of movement without
+        // the jittery wobble the old high-frequency terms produced.  Periods
+        // are now ~13 s / ~18 s (vs. the old fraction-of-a-second buzz), with
+        // a touch more travel so it still reads as a lazily rolling fog bank.
         let origin_x = -MAP_WIDTH * 0.5
             + segment_origin_x(fog.idx) as f32 * TILE_SIZE
             + SEG_WIDTH * 0.5;
-        transform.translation.x = origin_x + (t * 12.0 + phase).sin() * 6.0;
-        transform.translation.y = (t * 8.0 + phase * 0.7).cos() * 4.0;
+        transform.translation.x = origin_x + (t * 0.48 + phase).sin() * 9.0;
+        transform.translation.y = (t * 0.35 + phase * 0.7).cos() * 6.0;
     }
 }
 
 /// Pulses the window-glow alpha over time per-window.  Combines a slow
 /// sine with a small high-freq jitter so most windows breathe steadily but
 /// a few look like flickering bulbs.
-fn animate_window_glow(time: Res<Time>, mut q: Query<(&WindowGlow, &mut Sprite)>) {
+///
+/// This system is the window sprites' ONLY alpha writer:
+/// `update_building_roof_visibility` skips them (`Without<WindowGlow>`),
+/// because two systems tweening/overwriting the same channel every frame
+/// fought each other — so hiding the facade glow while the local player is
+/// inside the building is handled HERE, off the same footprint state the
+/// roof fade publishes.
+fn animate_window_glow(
+    time: Res<Time>,
+    inside: Res<LocalInsideBuilding>,
+    mut q: Query<(&WindowGlow, &BuildingRoof, &mut Sprite)>,
+) {
     let t = time.elapsed_seconds();
-    for (glow, mut sprite) in &mut q {
+    for (glow, roof, mut sprite) in &mut q {
+        // Player is inside this building — the exterior shell is hidden, so
+        // its facade windows must not glow on top of the revealed interior.
+        if inside.0 == Some(roof.idx) {
+            if sprite.color.alpha() != 0.0 {
+                sprite.color.set_alpha(0.0);
+            }
+            continue;
+        }
         let slow = (t * 0.7 + glow.phase).sin() * 0.5 + 0.5;
         let jitter = ((t * 6.0 + glow.phase * 1.7).sin() * 0.5 + 0.5).powi(8) * 0.4;
         let mix = slow * 0.78 + jitter * 0.22;
@@ -1208,18 +1333,19 @@ fn animate_window_glow(time: Res<Time>, mut q: Query<(&WindowGlow, &mut Sprite)>
 
 /// Scatters a few glowing window panes on the outside of an apartment /
 /// tower building.  Skips the wall side that holds the door so the entry
-/// way reads cleanly.  Tagged `BuildingRoof` so they hide when the local
-/// player steps inside the building (they belong to the exterior).
+/// way reads cleanly.  Tagged `BuildingRoof` so `animate_window_glow` can
+/// hide them when the local player steps inside the building (they belong
+/// to the exterior).  `win_tex` is shared across every building — sprites
+/// batch by image handle, so per-building copies would split the batch.
 fn spawn_building_windows(
     commands: &mut Commands,
-    images: &mut ResMut<Assets<Image>>,
+    win_tex: &Handle<Image>,
     idx: usize,
     b: &Building,
 ) {
     use rand::Rng;
     let (center, half) = building_world_rect(b);
     let door_side = building_door_side(b);
-    let win_tex = images.add(build_window_image());
 
     // Place rows of windows along each non-door wall.  Inset slightly so
     // they sit "inside" the wall thickness rather than on top of it.
@@ -1355,6 +1481,7 @@ fn spawn_map(
     mut obstacles: ResMut<MapObstacles>,
     mut wall_indices: ResMut<BuildingWallIndices>,
     mut floor_obstacles: ResMut<FloorObstacleIndices>,
+    mut respawn_table: ResMut<ExplodableRespawnTable>,
     gfx: Res<GraphicsSettings>,
 ) {
     let _ = gfx;
@@ -1496,6 +1623,18 @@ fn spawn_map(
         (BuildingType, RoofStyle, i32, i32),
         Handle<Image>,
     > = std::collections::HashMap::new();
+    // Window decals and multi-floor extras share their textures the same
+    // way: one handle for the ~100 windows, one per staircase / rooftop /
+    // roof-decor image across the 6 apartment/hospital blocks.
+    let window_tex = images.add(build_window_image());
+    let mut multi_floor_tex = MultiFloorTextures {
+        partition: std::collections::HashMap::new(),
+        staircase: images.add(build_staircase_image()),
+        rooftop_floor: images.add(build_rooftop_floor_image()),
+        hvac: images.add(build_hvac_image()),
+        antenna: images.add(build_antenna_image()),
+        vent: images.add(build_roof_vent_image()),
+    };
     for (idx, b) in BUILDINGS.iter().enumerate() {
         let (center, half) = building_world_rect(b);
         let wall_tex = wall_tex_cache
@@ -1581,11 +1720,12 @@ fn spawn_map(
         ));
 
         // ── Window glow decals on apartment + tower facades ────────────
-        // Tagged with `BuildingRoof` so they vanish when the player walks
-        // inside (they belong to the exterior shell).  Each window has its
-        // own phase so the building reads as several independent rooms.
+        // Tagged with `BuildingRoof` so `animate_window_glow` snuffs them
+        // when the player walks inside (they belong to the exterior shell).
+        // Each window has its own phase so the building reads as several
+        // independent rooms.
         if matches!(b.kind, BuildingType::Apartment | BuildingType::Tower) {
-            spawn_building_windows(&mut commands, &mut images, idx, b);
+            spawn_building_windows(&mut commands, &window_tex, idx, b);
         }
 
         // Door panel — fits the wall gap, lives BELOW the roof (z=-4.5)
@@ -1730,6 +1870,7 @@ fn spawn_map(
                 &mut images,
                 &mut obstacles,
                 &mut floor_obstacles,
+                &mut multi_floor_tex,
                 idx,
                 b,
             );
@@ -1772,9 +1913,23 @@ fn spawn_map(
         // trucks, jeeps and ambulances all wreck when shot, chain-igniting
         // crowds of zombies for cinematic kills.
         if let (Some(expl), Some(idx)) = (vehicle_explodable_for(p.kind), obs_idx) {
-            commands
-                .entity(prop_entity)
-                .insert((expl, ExplodableObstacleIdx(idx)));
+            commands.entity(prop_entity).insert((
+                expl,
+                ExplodableObstacleIdx(idx),
+                ExplodableSmolder::default(),
+            ));
+            // Record for `reset_explodables` — a fresh session respawns the
+            // vehicle with the same obstacle index and pristine HP.
+            respawn_table.entries.push(ExplodableRespawnEntry {
+                texture: prop_tex_cache[&p.kind].clone(),
+                sprite_size: size,
+                pos: center,
+                z,
+                obstacle_idx: idx,
+                shape: obstacles.list[idx].shape,
+                spec: expl,
+                decor: true,
+            });
         }
         // Streetlights flicker procedurally — adds atmosphere to the
         // post-apo blackout vibe.  Phase derived from world position so
@@ -1808,6 +1963,18 @@ fn spawn_map(
             pos: center,
             shape: ObstacleShape::Rect(half),
         });
+        // Record for `reset_explodables` — a fresh session respawns the
+        // wreck/barrel with the same obstacle index and pristine HP.
+        respawn_table.entries.push(ExplodableRespawnEntry {
+            texture: img.clone(),
+            sprite_size: spec.kind.sprite_size(),
+            pos: center,
+            z: -1.0,
+            obstacle_idx: obs_idx,
+            shape: ObstacleShape::Rect(half),
+            spec: spec.kind.default_spec(),
+            decor: false,
+        });
         commands.spawn((
             SpriteBundle {
                 texture: img,
@@ -1820,6 +1987,7 @@ fn spawn_map(
             },
             spec.kind.default_spec(),
             ExplodableObstacleIdx(obs_idx),
+            ExplodableSmolder::default(),
         ));
     }
 
@@ -2129,6 +2297,57 @@ fn reset_segment_state(
     obstacles.rebuild_grid();
 }
 
+/// Rebuild every explodable for a fresh session.  `spawn_map` runs only at
+/// Startup, so without this a new game after GameOver inherits every wreck
+/// and barrel destroyed (or chipped) in earlier runs of the same app launch
+/// — while waves, score, fog and floor state all reset.  Clients run it
+/// too: the next snapshot re-applies the host's `DestroyedExplodables` set,
+/// so a mid-game joiner still converges on the authoritative state.
+fn reset_explodables(
+    mut commands: Commands,
+    mut destroyed: ResMut<DestroyedExplodables>,
+    mut obstacles: ResMut<MapObstacles>,
+    table: Res<ExplodableRespawnTable>,
+    survivors: Query<Entity, With<Explodable>>,
+) {
+    // Despawn survivors wholesale — everything is respawned pristine below,
+    // which also resets partially-chipped `Explodable.hp`.
+    for entity in survivors.iter() {
+        commands.entity(entity).despawn_recursive();
+    }
+    destroyed.indices.clear();
+
+    for e in table.entries.iter() {
+        // Restore the collision entry IN PLACE: `ExplodableObstacleIdx`
+        // values ship over the wire in `DestroyedExplodables`, so indices
+        // must stay identical across sessions (and machines).
+        if let Some(o) = obstacles.list.get_mut(e.obstacle_idx) {
+            o.pos = e.pos;
+            o.shape = e.shape;
+        }
+        let mut spawned = commands.spawn((
+            SpriteBundle {
+                texture: e.texture.clone(),
+                sprite: Sprite {
+                    custom_size: Some(e.sprite_size),
+                    ..default()
+                },
+                transform: Transform::from_xyz(e.pos.x, e.pos.y, e.z),
+                ..default()
+            },
+            e.spec,
+            ExplodableObstacleIdx(e.obstacle_idx),
+            ExplodableSmolder::default(),
+        ));
+        if e.decor {
+            spawned.insert(MapDecor);
+        }
+    }
+    // Restored shapes changed obstacle AABBs (and a mid-run `remove_at`
+    // rebuild may have dropped the zeroed entries from the grid), so re-bin.
+    obstacles.rebuild_grid();
+}
+
 fn update_segment_fog_visibility(
     mut commands: Commands,
     state: Res<MapSegmentUnlockState>,
@@ -2151,11 +2370,26 @@ fn update_segment_fog_visibility(
     }
 }
 
+/// Texture handles shared by every multi-floor building.  Built once in
+/// `spawn_map` (the per-kind partition entries fill lazily) so the six
+/// apartment/hospital blocks don't each allocate byte-identical staircase /
+/// rooftop / roof-decor images — sprites batch by image handle, so
+/// duplicates split what could be a single draw batch per z run.
+struct MultiFloorTextures {
+    partition: std::collections::HashMap<BuildingType, Handle<Image>>,
+    staircase: Handle<Image>,
+    rooftop_floor: Handle<Image>,
+    hvac: Handle<Image>,
+    antenna: Handle<Image>,
+    vent: Handle<Image>,
+}
+
 fn spawn_multi_floor_extras(
     commands: &mut Commands,
     images: &mut ResMut<Assets<Image>>,
     obstacles: &mut ResMut<MapObstacles>,
     floor_obstacles: &mut ResMut<FloorObstacleIndices>,
+    textures: &mut MultiFloorTextures,
     idx: usize,
     b: &Building,
 ) {
@@ -2173,7 +2407,11 @@ fn spawn_multi_floor_extras(
     // while the player is on that exact floor.  Floor 0 (lobby) and the
     // top floor (rooftop) stay open.
     if matches!(b.kind, BuildingType::Apartment | BuildingType::Hospital) {
-        let interior_wall_tex = images.add(build_interior_partition_image(b.kind));
+        let interior_wall_tex = textures
+            .partition
+            .entry(b.kind)
+            .or_insert_with(|| images.add(build_interior_partition_image(b.kind)))
+            .clone();
         let walls = residential_floor_walls(b);
         for floor in 1..roof_floor {
             for &(offset, wall_half) in &walls {
@@ -2208,10 +2446,9 @@ fn spawn_multi_floor_extras(
 
     // ── Staircase prop (visible on every floor — no FloorEntity tag) ──
     let stair_pos = staircase_world_pos(b);
-    let stair_tex = images.add(build_staircase_image());
     commands.spawn((
         SpriteBundle {
-            texture: stair_tex,
+            texture: textures.staircase.clone(),
             sprite: Sprite {
                 custom_size: Some(Vec2::new(TILE_SIZE * 0.95, TILE_SIZE * 1.4)),
                 ..default()
@@ -2223,10 +2460,9 @@ fn spawn_multi_floor_extras(
     ));
 
     // ── Rooftop floor (concrete) — visible only when player on roof ──
-    let rooftop_floor_tex = images.add(build_rooftop_floor_image());
     commands.spawn((
         SpriteBundle {
-            texture: rooftop_floor_tex,
+            texture: textures.rooftop_floor.clone(),
             sprite: Sprite {
                 custom_size: Some(inner_half * 2.0),
                 ..default()
@@ -2241,14 +2477,10 @@ fn spawn_multi_floor_extras(
     // ── Rooftop decor: HVAC + antenna + vent (only the HVAC blocks).  ──
     // HVAC obstacle is registered into floor_obstacles so it only collides
     // while the player is actually standing on the roof.
-    let hvac_tex = images.add(build_hvac_image());
-    let antenna_tex = images.add(build_antenna_image());
-    let vent_tex = images.add(build_roof_vent_image());
-
     let hvac_pos = Vec2::new(center.x - inner_half.x * 0.4, center.y);
     commands.spawn((
         SpriteBundle {
-            texture: hvac_tex,
+            texture: textures.hvac.clone(),
             sprite: Sprite {
                 custom_size: Some(Vec2::new(48.0, 36.0)),
                 ..default()
@@ -2274,7 +2506,7 @@ fn spawn_multi_floor_extras(
     let antenna_pos = Vec2::new(center.x + inner_half.x * 0.5, center.y - inner_half.y * 0.3);
     commands.spawn((
         SpriteBundle {
-            texture: antenna_tex,
+            texture: textures.antenna.clone(),
             sprite: Sprite {
                 custom_size: Some(Vec2::new(20.0, 48.0)),
                 ..default()
@@ -2289,7 +2521,7 @@ fn spawn_multi_floor_extras(
     let vent_pos = Vec2::new(center.x + inner_half.x * 0.2, center.y + inner_half.y * 0.4);
     commands.spawn((
         SpriteBundle {
-            texture: vent_tex,
+            texture: textures.vent.clone(),
             sprite: Sprite {
                 custom_size: Some(Vec2::new(28.0, 20.0)),
                 ..default()
@@ -2360,21 +2592,27 @@ fn track_player_building_floor(
 
 fn update_floor_entity_visibility(
     state: Res<PlayerFloorState>,
+    inside: Res<LocalInsideBuilding>,
     mut entities: Query<(&FloorEntity, &mut Visibility)>,
 ) {
-    // Floor visibility only changes when the player changes floor/building.
-    // `PlayerFloorState` is now mutated only on real transitions (the per-tick
-    // stair cooldown lives in its own resource), so this gate skips the full
-    // entity sweep on the vast majority of frames.
-    if !state.is_changed() {
+    // Floor visibility only changes when the player changes floor/building
+    // or crosses a footprint boundary.  Both resources are mutated only on
+    // real transitions (the per-tick stair cooldown lives in its own
+    // resource), so this gate skips the full entity sweep on the vast
+    // majority of frames.
+    if !state.is_changed() && !inside.is_changed() {
         return;
     }
     for (fe, mut vis) in entities.iter_mut() {
         let want_visible = match state.building {
             Some(b) if b == fe.building => state.floor == fe.floor,
-            // Player is outside this building: only ground floor entities
-            // are visible (rooftop content stays hidden).
-            _ => fe.floor == 0,
+            // Player is outside this building: hide the whole interior —
+            // an opaque roof covers it, and stacking 4-6 blended layers
+            // beneath that roof is pure fill-rate waste on tiled mobile
+            // GPUs.  The ground floor shows only while the local player is
+            // in the footprint (`LocalInsideBuilding` flips in sync with
+            // the roof fade, so the reveal still reads correctly).
+            _ => fe.floor == 0 && inside.0 == Some(fe.building),
         };
         *vis = if want_visible {
             Visibility::Inherited
@@ -2557,31 +2795,38 @@ fn check_roof_fall(
 }
 
 fn update_building_roof_visibility(
-    mut roofs: Query<(&BuildingRoof, &mut Sprite, &mut Visibility)>,
+    // `Without<WindowGlow>` keeps this system off the window decals (also
+    // tagged `BuildingRoof`) — `animate_window_glow` is their one Sprite
+    // writer, so the two systems no longer fight over the same alpha.
+    mut roofs: Query<(&BuildingRoof, &mut Sprite, &mut Visibility), Without<WindowGlow>>,
     players: Query<(&Transform, &Player)>,
     ctx: Res<NetContext>,
     time: Res<Time>,
+    mut inside_state: ResMut<LocalInsideBuilding>,
 ) {
     let local_pos = players
         .iter()
         .find(|(_, p)| p.id == ctx.my_id)
         .or_else(|| players.iter().next())
         .map(|(t, _)| t.translation.truncate());
+    // Which building footprint is the local player standing in?  Computed
+    // once with the margin every roof below shares: wall thickness, so the
+    // cutout only kicks in once the player is fully past the wall midline
+    // (no flicker at the door).
+    let inside_now: Option<usize> = local_pos.and_then(|p| {
+        BUILDINGS.iter().position(|b| {
+            let (center, half) = building_world_rect(b);
+            let margin = BUILDING_WALL_THICK;
+            (p.x - center.x).abs() < half.x - margin
+                && (p.y - center.y).abs() < half.y - margin
+        })
+    });
     let dt = time.delta_seconds();
+    // Alpha of the roof the player most recently occupied — drives the
+    // exit hold on `LocalInsideBuilding` below.
+    let mut prev_roof_alpha = 1.0f32;
     for (roof, mut sprite, mut vis) in roofs.iter_mut() {
-        let Some(b) = BUILDINGS.get(roof.idx) else {
-            continue;
-        };
-        let (center, half) = building_world_rect(b);
-        // Margin = wall thickness so the cutout only kicks in once the
-        // player is fully past the wall midline (no flicker at the door).
-        let margin = BUILDING_WALL_THICK;
-        let inside = local_pos
-            .map(|p| {
-                (p.x - center.x).abs() < half.x - margin
-                    && (p.y - center.y).abs() < half.y - margin
-            })
-            .unwrap_or(false);
+        let inside = inside_now == Some(roof.idx);
         // Smooth alpha tween: roof never hard-disappears.  When the player
         // is inside, drop to ~0 alpha so the interior reads cleanly; when
         // outside, return to full opacity.  Decay rate is fast enough that
@@ -2589,6 +2834,9 @@ fn update_building_roof_visibility(
         let target_alpha: f32 = if inside { 0.0 } else { 1.0 };
         let mut color = sprite.color.to_srgba();
         let cur = color.alpha;
+        if inside_state.0 == Some(roof.idx) {
+            prev_roof_alpha = cur;
+        }
         // Roof already settled at its target alpha — skip the sprite/visibility
         // writes so a resting roof (the common case: player nowhere near it)
         // doesn't dirty the Sprite and force a renderer re-extract every frame.
@@ -2602,6 +2850,19 @@ fn update_building_roof_visibility(
         // Bevy still needs Visibility::Inherited so the sprite renders at
         // all — we never set it to Hidden any more.
         *vis = Visibility::Inherited;
+    }
+    // Publish the footprint index for the interior-culling and window-glow
+    // systems.  Entering flips immediately (the interior must already be
+    // drawn while the roof fades OUT); leaving holds the old index until
+    // that roof has tweened back to opaque, so the interior doesn't vanish
+    // under a still-translucent roof.  Written only on real transitions to
+    // keep `update_floor_entity_visibility`'s change-detection gate useful.
+    let new_inside = match (inside_state.0, inside_now) {
+        (Some(prev), None) if prev_roof_alpha < 0.999 => Some(prev),
+        _ => inside_now,
+    };
+    if inside_state.0 != new_inside {
+        inside_state.0 = new_inside;
     }
 }
 
