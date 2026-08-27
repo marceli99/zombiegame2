@@ -35,7 +35,32 @@ use crate::player::Player;
 pub const WINDOW_WIDTH: f32 = 1280.0;
 pub const WINDOW_HEIGHT: f32 = 720.0;
 pub const FIXED_VIEW_H: f32 = 760.0;
+/// Vertical world height the 2D camera frames on phones.  Desktop's 760 reads
+/// as "too far away" on a small screen held close, so phones render fewer world
+/// units vertically (≈1.6× zoom) to make the action read bigger.  Tuned on a
+/// 20:9 landscape phone; smaller = more zoom.  Shared by `setup_camera` and
+/// `camera_follow` via `view_height()` so the projection and the clamp math
+/// never disagree.
+pub const MOBILE_VIEW_H: f32 = 360.0;
 pub const TICK_HZ: f64 = 60.0;
+
+/// True when this run uses the mobile/touch profile — a real phone (Android /
+/// iOS) or the `ZG_FORCE_TOUCH` desktop preview.  Mirrors the condition that
+/// lights up the on-screen touch controls so the zoom and the controls always
+/// turn on together.
+pub fn mobile_profile() -> bool {
+    cfg!(any(target_os = "android", target_os = "ios")) || std::env::var("ZG_FORCE_TOUCH").is_ok()
+}
+
+/// Effective vertical view height for the 2D camera — the single source of
+/// truth shared by `setup_camera` (projection) and `camera_follow` (clamp).
+pub fn view_height() -> f32 {
+    if mobile_profile() {
+        MOBILE_VIEW_H
+    } else {
+        FIXED_VIEW_H
+    }
+}
 
 #[derive(States, Default, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GameState {
@@ -167,7 +192,7 @@ pub fn run() {
 
 fn setup_camera(mut commands: Commands) {
     let mut camera = Camera2dBundle::default();
-    camera.projection.scaling_mode = ScalingMode::FixedVertical(FIXED_VIEW_H);
+    camera.projection.scaling_mode = ScalingMode::FixedVertical(view_height());
 
     // Mobile GPUs are tiled + bandwidth-bound and choke on HDR rendering, a
     // multi-pass bloom, and a LUT-based tonemapper — and those features also
@@ -240,10 +265,11 @@ fn camera_follow(
     } else {
         WINDOW_WIDTH / WINDOW_HEIGHT
     };
-    let view_w = FIXED_VIEW_H * aspect;
+    let view_h = view_height();
+    let view_w = view_h * aspect;
 
     let half_view_w = view_w * 0.5;
-    let half_view_h = FIXED_VIEW_H / 2.0;
+    let half_view_h = view_h / 2.0;
 
     // Camera clamp is context-dependent: while the player is on the
     // surface we clamp to the surface map rect; once they descend below

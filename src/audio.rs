@@ -17,15 +17,19 @@ pub enum SfxEvent {
     Heal,
 }
 
+/// A looping ambience layer.  `base` is its volume at 100% master, so
+/// `apply_ambience_volume` can rescale the live sink when the master changes.
 #[derive(Component)]
-struct MenuAmbience;
+struct MenuAmbience {
+    base: f32,
+}
 
 pub struct AudioFxPlugin;
 
 impl Plugin for AudioFxPlugin {
     fn build(&self, app: &mut App) {
         app.add_event::<SfxEvent>()
-            .add_systems(Update, play_sfx)
+            .add_systems(Update, (play_sfx, apply_ambience_volume))
             .add_systems(
                 OnEnter(GameState::Menu),
                 ensure_menu_ambience,
@@ -51,9 +55,10 @@ fn play_sfx(
     mut commands: Commands,
     mut events: EventReader<SfxEvent>,
     mut pitches: ResMut<Assets<Pitch>>,
+    settings: Res<crate::settings::GraphicsSettings>,
 ) {
     for ev in events.read() {
-        let (freq, ms, vol) = match ev {
+        let (freq, ms, base_vol) = match ev {
             SfxEvent::Shot => (880.0, 45, 0.12),
             SfxEvent::Hit => (520.0, 35, 0.12),
             SfxEvent::ZombieDeath => (160.0, 180, 0.20),
@@ -64,6 +69,7 @@ fn play_sfx(
             SfxEvent::MenuCancel => (98.0, 140, 0.15),
             SfxEvent::Heal => (660.0, 100, 0.18),
         };
+        let vol = base_vol * settings.volume;
         commands.spawn(PitchBundle {
             source: pitches.add(Pitch {
                 frequency: freq,
@@ -78,45 +84,44 @@ fn ensure_menu_ambience(
     mut commands: Commands,
     existing: Query<Entity, With<MenuAmbience>>,
     mut pitches: ResMut<Assets<Pitch>>,
+    settings: Res<crate::settings::GraphicsSettings>,
 ) {
     if !existing.is_empty() {
         return;
     }
-    let loop_settings = |vol: f32| PlaybackSettings {
+    let master = settings.volume;
+    let loop_settings = |base: f32| PlaybackSettings {
         mode: PlaybackMode::Loop,
-        volume: Volume::new(vol),
+        volume: Volume::new(base * master),
         ..default()
     };
-    commands.spawn((
-        PitchBundle {
-            source: pitches.add(Pitch {
-                frequency: 55.0,
-                duration: Duration::from_secs(3),
-            }),
-            settings: loop_settings(0.12),
-        },
-        MenuAmbience,
-    ));
-    commands.spawn((
-        PitchBundle {
-            source: pitches.add(Pitch {
-                frequency: 82.4,
-                duration: Duration::from_secs(3),
-            }),
-            settings: loop_settings(0.07),
-        },
-        MenuAmbience,
-    ));
-    commands.spawn((
-        PitchBundle {
-            source: pitches.add(Pitch {
-                frequency: 138.6,
-                duration: Duration::from_secs(3),
-            }),
-            settings: loop_settings(0.04),
-        },
-        MenuAmbience,
-    ));
+    // (frequency, base volume at 100% master)
+    for (freq, base) in [(55.0, 0.12), (82.4, 0.07), (138.6, 0.04)] {
+        commands.spawn((
+            PitchBundle {
+                source: pitches.add(Pitch {
+                    frequency: freq,
+                    duration: Duration::from_secs(3),
+                }),
+                settings: loop_settings(base),
+            },
+            MenuAmbience { base },
+        ));
+    }
+}
+
+/// Rescale the playing ambience when the master volume changes, so the slider
+/// in Settings is audible immediately rather than only after re-entering a menu.
+fn apply_ambience_volume(
+    settings: Res<crate::settings::GraphicsSettings>,
+    sinks: Query<(&MenuAmbience, &AudioSink)>,
+) {
+    if !settings.is_changed() {
+        return;
+    }
+    for (layer, sink) in &sinks {
+        sink.set_volume(layer.base * settings.volume);
+    }
 }
 
 fn stop_menu_ambience(

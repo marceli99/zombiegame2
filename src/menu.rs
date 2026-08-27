@@ -93,21 +93,84 @@ const ITEMS: [&str; 7] = [
     "QUIT",
 ];
 
-const SETTINGS_ROW_COUNT: usize = 8;
-const SETTINGS_LABELS: [&str; SETTINGS_ROW_COUNT] = [
-    "RESOLUTION",
-    "WINDOW MODE",
-    "VSYNC",
-    "FPS LIMIT",
-    "QUALITY",
-    "FPS COUNTER",
-    "RESET DEFAULTS",
-    "BACK",
-];
+/// How long the QUIT confirm stays armed after an Escape / Back press; a
+/// second press inside this window actually exits.
+const QUIT_CONFIRM_WINDOW: f64 = 2.0;
+/// Status-line hint shown while the quit confirm is armed.
+const QUIT_HINT: &str = "PRESS AGAIN TO QUIT";
 
-/// Selection indices for action rows (Enter triggers, no left/right value).
-const SETTINGS_ROW_RESET: usize = 6;
-const SETTINGS_ROW_BACK: usize = 7;
+/// One row of the settings screen.  Rows are listed per-platform by
+/// `settings_rows()` rather than indexed positionally, so mobile can show a
+/// trimmed set without the value/action logic drifting out of sync.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingKind {
+    Volume,
+    Resolution,
+    WindowMode,
+    Vsync,
+    FpsLimit,
+    Quality,
+    FpsCounter,
+    ResetDefaults,
+    Back,
+}
+
+impl SettingKind {
+    fn label(self) -> &'static str {
+        match self {
+            SettingKind::Volume => "VOLUME",
+            SettingKind::Resolution => "RESOLUTION",
+            SettingKind::WindowMode => "WINDOW MODE",
+            SettingKind::Vsync => "VSYNC",
+            SettingKind::FpsLimit => "FPS LIMIT",
+            SettingKind::Quality => "QUALITY",
+            SettingKind::FpsCounter => "FPS COUNTER",
+            SettingKind::ResetDefaults => "RESET DEFAULTS",
+            SettingKind::Back => "BACK",
+        }
+    }
+
+    fn value(self, s: &GraphicsSettings) -> String {
+        match self {
+            SettingKind::Volume => s.volume_label(),
+            SettingKind::Resolution => s.resolution_label(),
+            SettingKind::WindowMode => s.window_mode_label().to_string(),
+            SettingKind::Vsync => s.vsync_label().to_string(),
+            SettingKind::FpsLimit => s.fps_cap_label(),
+            SettingKind::Quality => s.quality_label().to_string(),
+            SettingKind::FpsCounter => s.show_fps_label().to_string(),
+            // Action rows have no right-hand value.
+            SettingKind::ResetDefaults | SettingKind::Back => String::new(),
+        }
+    }
+
+    /// True for rows whose value left/right cycles (vs. Enter-only action rows).
+    fn is_value_row(self) -> bool {
+        !matches!(self, SettingKind::ResetDefaults | SettingKind::Back)
+    }
+}
+
+/// The settings rows shown on this platform.  Phones get only the master volume
+/// — resolution / window mode / vsync / fps / quality are meaningless on a
+/// fullscreen, fixed-resolution device, so they're hidden there.
+fn settings_rows() -> &'static [SettingKind] {
+    use SettingKind::*;
+    if crate::mobile_profile() {
+        &[Volume, Back]
+    } else {
+        &[
+            Volume,
+            Resolution,
+            WindowMode,
+            Vsync,
+            FpsLimit,
+            Quality,
+            FpsCounter,
+            ResetDefaults,
+            Back,
+        ]
+    }
+}
 
 const BG_COLOR: Color = Color::srgb(0.012, 0.016, 0.022);
 const PANEL_COLOR: Color = Color::srgba(0.035, 0.04, 0.05, 0.94);
@@ -137,7 +200,15 @@ impl Plugin for MenuPlugin {
             .add_systems(OnExit(GameState::Menu), despawn_menu)
             .add_systems(
                 Update,
-                (menu_navigate, menu_highlight, update_menu_error)
+                // `menu_touch_select` runs first so a tap's synthetic Enter is
+                // visible to `menu_navigate` in the same frame.
+                (
+                    menu_touch_select,
+                    menu_navigate,
+                    menu_highlight,
+                    update_menu_error,
+                )
+                    .chain()
                     .run_if(in_state(GameState::Menu)),
             )
             .add_systems(OnEnter(GameState::Settings), spawn_settings)
@@ -382,8 +453,21 @@ fn spawn_menu(
                                         font_size: 24.0,
                                         color: TEXT_NORMAL,
                                     },
-                                ),
+                                )
+                                // Padding enlarges the node's box so it's a
+                                // comfortable touch target, not just the glyph
+                                // bounds.  `Interaction` makes bevy_ui hit-test
+                                // taps/clicks against it (handles touch + DPI).
+                                .with_style(Style {
+                                    padding: UiRect::axes(Val::Px(30.0), Val::Px(10.0)),
+                                    ..default()
+                                })
+                                // Selection decorations must never word-wrap —
+                                // a wrapped "<" doubles the item's height and
+                                // the whole column visibly jumps.
+                                .with_no_wrap(),
                                 MenuItem { index: i },
+                                Interaction::default(),
                             ));
                         }
                     });
@@ -396,7 +480,16 @@ fn spawn_menu(
                             font_size: 12.0,
                             color: ERROR_COLOR,
                         },
-                    ),
+                    )
+                    // Reserve one line of height: an empty Text measures 0px,
+                    // so without this the panel grows/shrinks (and every item
+                    // shifts vertically) each time the quit hint or an error
+                    // toggles.  min_height, not height — real errors ("Host
+                    // fail: …") may still wrap onto more lines.
+                    .with_style(Style {
+                        min_height: Val::Px(14.0),
+                        ..default()
+                    }),
                     MenuErrorText,
                 ));
                 panel.spawn(
@@ -423,6 +516,29 @@ fn despawn_menu(mut commands: Commands, q: Query<Entity, With<MenuRoot>>) {
     }
 }
 
+/// Touch / mouse support for the main menu: tapping an item selects it and
+/// fires a synthetic Enter, so the existing `menu_navigate` confirm logic runs
+/// unchanged.  bevy_ui's focus system sets `Interaction::Pressed` for both
+/// clicks and finger taps (hit-testing in logical UI space, so DPI/rotation are
+/// handled for us) — which is why the menu text was previously un-tappable: the
+/// items had no `Interaction` and only the on-screen nav buttons drove it.
+fn menu_touch_select(
+    mut selection: ResMut<MenuSelection>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    mut injected: ResMut<crate::mobile::InjectedKeys>,
+    items: Query<(&MenuItem, &Interaction), Changed<Interaction>>,
+) {
+    for (item, interaction) in &items {
+        if *interaction == Interaction::Pressed {
+            selection.0 = item.index;
+            // Record the synthetic Enter so `release_injected_keys` clears it —
+            // otherwise it sticks in `pressed` and the *next* tap won't confirm.
+            keys.press(KeyCode::Enter);
+            injected.0.push(KeyCode::Enter);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn menu_navigate(
     keys: Res<ButtonInput<KeyCode>>,
@@ -434,6 +550,8 @@ fn menu_navigate(
     mut sfx: EventWriter<SfxEvent>,
     local_nick: Res<LocalNickname>,
     mut nicknames: ResMut<PlayerNicknames>,
+    time: Res<Time>,
+    mut quit_armed: Local<Option<f64>>,
 ) {
     let up = keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW);
     let down = keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS);
@@ -444,6 +562,16 @@ fn menu_navigate(
     if down {
         selection.0 = (selection.0 + 1) % ITEMS.len();
         sfx.send(SfxEvent::MenuMove);
+    }
+    // A pending quit confirm lapses after a short window, and moving the
+    // cursor cancels it; drop the hint too, but never a real error message.
+    let now = time.elapsed_seconds_f64();
+    let lapsed = quit_armed.is_some_and(|armed| now - armed > QUIT_CONFIRM_WINDOW);
+    if quit_armed.is_some() && (lapsed || up || down) {
+        *quit_armed = None;
+        if error.0 == QUIT_HINT {
+            error.0.clear();
+        }
     }
     if keys.just_pressed(KeyCode::Enter) || keys.just_pressed(KeyCode::Space) {
         sfx.send(SfxEvent::MenuSelect);
@@ -494,20 +622,36 @@ fn menu_navigate(
                 next_state.set(GameState::Guide);
             }
             6 => {
-                ctx.disconnect();
-                std::process::exit(0);
+                // Enter (including the tap-injected one from
+                // `menu_touch_select`) goes through the same two-step confirm
+                // as Escape — one stray press/tap on the QUIT row's big touch
+                // hit box must not kill the app instantly.
+                if quit_armed.is_some() {
+                    ctx.disconnect();
+                    std::process::exit(0);
+                }
+                *quit_armed = Some(now);
+                error.0 = QUIT_HINT.to_string();
             }
             _ => {}
         }
     }
     if keys.just_pressed(KeyCode::Escape) {
-        // Esc moves the cursor onto WYJSCIE (index 6) — second Esc / Enter
-        // there exits.  This stops accidentally killing the app when a
-        // player just wanted to back out of a sub-menu.
+        // Esc moves the cursor onto QUIT (index 6) — a second Esc (or Enter)
+        // there within a short window exits.  This stops accidentally killing
+        // the app when a player just wanted to back out of a sub-menu; the
+        // mobile Back nav button injects this same Escape.
+        if selection.0 == 6 && quit_armed.is_some() {
+            sfx.send(SfxEvent::MenuSelect);
+            ctx.disconnect();
+            std::process::exit(0);
+        }
         if selection.0 != 6 {
             selection.0 = 6;
             sfx.send(SfxEvent::MenuMove);
         }
+        *quit_armed = Some(now);
+        error.0 = QUIT_HINT.to_string();
     }
 }
 
@@ -518,10 +662,15 @@ fn menu_highlight(selection: Res<MenuSelection>, mut items: Query<(&MenuItem, &m
     for (item, mut text) in &mut items {
         let selected = item.index == selection.0;
         let label = ITEMS[item.index];
+        // Single-space decorations keep the longest label ("SINGLE PLAYER",
+        // 17 chars decorated) inside the 560px panel's content box even with
+        // the 30px touch padding — the old double-space variant hit 19 chars
+        // (456px of PressStart2P at 24px) and word-wrapped the trailing "<"
+        // onto a second line, shoving the whole item column around.
         text.sections[0].value = if selected {
-            format!(">  {label}  <")
+            format!("> {label} <")
         } else {
-            format!("   {label}   ")
+            format!("  {label}  ")
         };
         text.sections[0].style.color = if selected { TEXT_HIGHLIGHT } else { TEXT_NORMAL };
     }
@@ -578,7 +727,8 @@ fn spawn_settings(
             .with_children(|panel| {
                 spawn_title_block(panel, &font, "SETTINGS");
                 panel.spawn(TextBundle::from_section(
-                    "GRAPHICS",
+                    // Mobile shows only the volume row, so "GRAPHICS" would lie.
+                    if crate::mobile_profile() { "AUDIO" } else { "GRAPHICS" },
                     TextStyle {
                         font: font.clone(),
                         font_size: 16.0,
@@ -598,7 +748,7 @@ fn spawn_settings(
                         ..default()
                     })
                     .with_children(|list| {
-                        for i in 0..SETTINGS_ROW_COUNT {
+                        for i in 0..settings_rows().len() {
                             spawn_settings_row(list, &font, i, &settings);
                         }
                     });
@@ -641,15 +791,16 @@ fn spawn_settings_row(
         SettingsRow { index },
     ))
     .with_children(|row| {
+        let kind = settings_rows()[index];
         row.spawn(TextBundle::from_section(
-            SETTINGS_LABELS[index],
+            kind.label(),
             TextStyle {
                 font: font.clone(),
                 font_size: 18.0,
                 color: TEXT_NORMAL,
             },
         ));
-        let value = settings_value_text(settings, index);
+        let value = kind.value(settings);
         row.spawn((
             TextBundle::from_section(
                 value,
@@ -662,19 +813,6 @@ fn spawn_settings_row(
             SettingsValueText { index },
         ));
     });
-}
-
-fn settings_value_text(settings: &GraphicsSettings, index: usize) -> String {
-    match index {
-        0 => settings.resolution_label(),
-        1 => settings.window_mode_label().to_string(),
-        2 => settings.vsync_label().to_string(),
-        3 => settings.fps_cap_label(),
-        4 => settings.quality_label().to_string(),
-        5 => settings.show_fps_label().to_string(),
-        // RESET DEFAULTS / BACK rows are action rows — no value text.
-        _ => String::new(),
-    }
 }
 
 fn despawn_settings(mut commands: Commands, q: Query<Entity, With<SettingsRoot>>) {
@@ -695,35 +833,39 @@ fn settings_input(
     let left = keys.just_pressed(KeyCode::ArrowLeft) || keys.just_pressed(KeyCode::KeyA);
     let right = keys.just_pressed(KeyCode::ArrowRight) || keys.just_pressed(KeyCode::KeyD);
 
+    let rows = settings_rows();
+    let count = rows.len();
     if up {
-        selection.0 = (selection.0 + SETTINGS_ROW_COUNT - 1) % SETTINGS_ROW_COUNT;
+        selection.0 = (selection.0 + count - 1) % count;
         sfx.send(SfxEvent::MenuMove);
     }
     if down {
-        selection.0 = (selection.0 + 1) % SETTINGS_ROW_COUNT;
+        selection.0 = (selection.0 + 1) % count;
         sfx.send(SfxEvent::MenuMove);
     }
 
+    let kind = rows[selection.0.min(count - 1)];
     if left || right {
         let forward = right;
-        match selection.0 {
-            0 => settings.cycle_resolution(forward),
-            1 => settings.cycle_window_mode(forward),
-            2 => settings.toggle_vsync(),
-            3 => settings.cycle_fps_cap(forward),
-            4 => settings.cycle_quality(forward),
-            5 => settings.toggle_show_fps(),
-            _ => {}
+        match kind {
+            SettingKind::Volume => settings.cycle_volume(forward),
+            SettingKind::Resolution => settings.cycle_resolution(forward),
+            SettingKind::WindowMode => settings.cycle_window_mode(forward),
+            SettingKind::Vsync => settings.toggle_vsync(),
+            SettingKind::FpsLimit => settings.cycle_fps_cap(forward),
+            SettingKind::Quality => settings.cycle_quality(forward),
+            SettingKind::FpsCounter => settings.toggle_show_fps(),
+            // Action rows have no left/right value to cycle.
+            SettingKind::ResetDefaults | SettingKind::Back => {}
         }
-        // Action rows (RESET / BACK) have no left/right value to cycle.
-        if selection.0 < SETTINGS_ROW_RESET {
+        if kind.is_value_row() {
             sfx.send(SfxEvent::MenuMove);
         }
     }
 
     if keys.just_pressed(KeyCode::Enter) {
-        match selection.0 {
-            SETTINGS_ROW_RESET => {
+        match kind {
+            SettingKind::ResetDefaults => {
                 // Replace the resource with defaults — `is_changed()` then
                 // fires next frame and `apply_graphics_settings` pushes the
                 // window/vsync/etc. back to factory values.  The save-on-change
@@ -731,7 +873,7 @@ fn settings_input(
                 *settings = GraphicsSettings::default();
                 sfx.send(SfxEvent::MenuSelect);
             }
-            SETTINGS_ROW_BACK => {
+            SettingKind::Back => {
                 sfx.send(SfxEvent::MenuCancel);
                 next_state.set(GameState::Menu);
                 return;
@@ -758,9 +900,10 @@ fn settings_refresh(
         return;
     }
 
+    let rows_list = settings_rows();
     for (value_marker, mut text) in &mut values {
         let idx = value_marker.index;
-        text.sections[0].value = settings_value_text(&settings, idx);
+        text.sections[0].value = rows_list[idx].value(&settings);
         let selected = idx == selection.0;
         text.sections[0].style.color = if selected {
             TEXT_HIGHLIGHT
@@ -775,7 +918,7 @@ fn settings_refresh(
             let Ok(mut text) = labels.get_mut(*child) else {
                 continue;
             };
-            let raw_label = SETTINGS_LABELS[row.index];
+            let raw_label = rows_list[row.index].label();
             text.sections[0].value = if selected {
                 format!("> {raw_label}")
             } else {
@@ -1199,8 +1342,8 @@ fn spawn_guide(mut commands: Commands, assets: Res<UiAssets>) {
                     "Normal  -  Standard zombie\n\
                      Fast  -  Quick but fragile\n\
                      Exploder  -  Explodes on contact! Keep distance\n\
-                     Burning  -  Sets you on fire (35 HP over 10s). Avoid!\n\
-                     Giant  -  Massive HP, very slow. Appears after wave 5",
+                     Burning  -  Ignites you (35 HP over 10s). Avoid!\n\
+                     Giant  -  Massive HP, very slow. From wave 5 on",
                     body.clone(),
                 ));
 

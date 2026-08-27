@@ -61,6 +61,12 @@ impl WindowModeChoice {
     }
 }
 
+/// Default master volume — also the fallback when loading a settings file
+/// written before the `volume` field existed (`serde(default)`).
+fn default_volume() -> f32 {
+    0.8
+}
+
 #[derive(Resource, Clone, Serialize, Deserialize)]
 pub struct GraphicsSettings {
     pub resolution_idx: usize,
@@ -69,6 +75,10 @@ pub struct GraphicsSettings {
     pub fps_cap_idx: usize,
     pub quality_idx: usize,
     pub show_fps: bool,
+    /// Master volume 0.0–1.0, applied to every sound (the only setting exposed
+    /// on mobile).  `serde(default)` keeps older on-disk settings loadable.
+    #[serde(default = "default_volume")]
+    pub volume: f32,
 }
 
 #[derive(Resource, Default)]
@@ -83,6 +93,7 @@ impl Default for GraphicsSettings {
             fps_cap_idx: 0,
             quality_idx: 2,
             show_fps: false,
+            volume: default_volume(),
         }
     }
 }
@@ -156,6 +167,17 @@ impl GraphicsSettings {
         self.show_fps = !self.show_fps;
     }
 
+    pub fn volume_label(&self) -> String {
+        format!("{}%", (self.volume * 100.0).round() as i32)
+    }
+
+    /// Step the master volume by 10%, clamped to 0–100% and snapped to the grid
+    /// so floating-point drift can't leave it at e.g. 79%.
+    pub fn cycle_volume(&mut self, forward: bool) {
+        let steps = (self.volume * 10.0).round() + if forward { 1.0 } else { -1.0 };
+        self.volume = (steps.clamp(0.0, 10.0)) / 10.0;
+    }
+
     pub fn show_fps_label(&self) -> &'static str {
         if self.show_fps { "ON" } else { "OFF" }
     }
@@ -179,7 +201,10 @@ impl Plugin for SettingsPlugin {
     }
 }
 
-fn settings_path() -> PathBuf {
+/// Per-platform writable base directory for persistent data, shared by
+/// settings and achievements (see `achievements::save_dir`).  `None` means
+/// no platform dir could be resolved; callers fall back to the cwd.
+pub fn data_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     let base = std::env::var("HOME")
         .ok()
@@ -195,10 +220,34 @@ fn settings_path() -> PathBuf {
         });
     #[cfg(target_os = "windows")]
     let base = std::env::var("APPDATA").ok().map(PathBuf::from);
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    // iOS sets HOME to the app's sandbox container, so the macOS layout works
+    // (create_dir_all makes the Application Support subdir on first save).
+    #[cfg(target_os = "ios")]
+    let base = std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join("Library/Application Support"));
+    // Android: cwd is "/" and HOME is unset, so ask the NativeActivity handle
+    // (populated by `#[bevy_main]` before `App::run`) for the app-private
+    // internal files dir.
+    #[cfg(target_os = "android")]
+    let base = bevy::winit::ANDROID_APP
+        .get()
+        .and_then(|app| app.internal_data_path());
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "ios",
+        target_os = "android"
+    )))]
     let base: Option<PathBuf> = None;
 
-    base.map(|b| b.join("zombiegame2"))
+    base
+}
+
+fn settings_path() -> PathBuf {
+    data_dir()
+        .map(|b| b.join("zombiegame2"))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("settings.json")
 }
@@ -237,10 +286,14 @@ fn load_settings() -> Option<GraphicsSettings> {
 fn save_settings(settings: &GraphicsSettings) {
     let path = settings_path();
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!("Failed to create settings dir {}: {}", parent.display(), e);
+        }
     }
     if let Ok(data) = serde_json::to_string_pretty(settings) {
-        let _ = std::fs::write(&path, data);
+        if let Err(e) = std::fs::write(&path, data) {
+            warn!("Failed to save settings to {}: {}", path.display(), e);
+        }
     }
 }
 
@@ -293,6 +346,12 @@ fn apply_graphics_settings(
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
 ) {
     if !settings.is_changed() {
+        return;
+    }
+    // On phones the window is OS-managed fullscreen and the only exposed setting
+    // is volume, so never poke the window here — a volume change must not try to
+    // restyle resolution / window mode / present mode.
+    if crate::mobile_profile() {
         return;
     }
     let Ok(mut window) = windows.get_single_mut() else {

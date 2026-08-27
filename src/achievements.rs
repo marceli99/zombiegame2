@@ -82,10 +82,21 @@ impl AchievementId {
 // ── Persistence ───────────────────────────────────────────────────
 
 fn save_dir() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".zombiegame2")
+    // Desktop keeps the historical `$HOME/.zombiegame2` location so existing
+    // progress is preserved; phones route through the shared per-platform
+    // data dir (their HOME/cwd fallbacks are unset or unwritable).
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let dir = {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home).join(".zombiegame2")
+    };
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    let dir = crate::settings::data_dir()
+        .map(|b| b.join("zombiegame2"))
+        .unwrap_or_else(|| PathBuf::from("."));
+    dir
 }
 
 #[derive(Resource, Default, Serialize, Deserialize)]
@@ -135,11 +146,15 @@ impl AchievementSave {
 
     pub fn save(&self) {
         let dir = save_dir();
-        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            warn!("Failed to create save dir {}: {}", dir.display(), e);
+        }
         let mut path = dir;
         path.push("save.json");
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, json);
+            if let Err(e) = std::fs::write(&path, json) {
+                warn!("Failed to save achievements to {}: {}", path.display(), e);
+            }
         }
     }
 }
@@ -286,6 +301,8 @@ fn track_damage(
     }
 }
 
+/// Record a fresh unlock (returns false if already earned).  Does NOT write
+/// to disk — `check_achievements` batches one save per unlock frame.
 fn try_unlock(
     id: AchievementId,
     save: &mut AchievementSave,
@@ -296,7 +313,6 @@ fn try_unlock(
     }
     save.unlocked.insert(id);
     tracker.pending_toasts.push_back(id);
-    save.save();
     true
 }
 
@@ -395,6 +411,10 @@ fn check_achievements(
     }
 
     if any_new {
+        // One batched write per unlock frame as crash insurance (the durable
+        // flush is `save_on_exit`) — several unlocks in the same frame used
+        // to cost one full-file write each.
+        save.save();
         sfx.send(SfxEvent::MenuSelect);
     }
 }
