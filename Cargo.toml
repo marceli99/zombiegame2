@@ -17,7 +17,29 @@ crate-type = ["rlib", "cdylib", "staticlib"]
 ios_sim = ["bevy/ios_simulator"]
 
 [dependencies]
-bevy = "0.14"
+# Trimmed feature set: everything the game touches (2D sprites, UI/text, states,
+# procedural `Pitch` audio, gamepads, bloom + TonyMcMapface tonemapping which
+# needs the `tonemapping_luts`/`ktx2`/`zstd` trio) and nothing it doesn't —
+# drops gltf/pbr/scene/animation/gizmos and the png/hdr/vorbis asset loaders
+# from the build for faster compiles and a smaller binary on every platform.
+bevy = { version = "0.14", default-features = false, features = [
+    "android_shared_stdcxx",
+    "bevy_asset",
+    "bevy_audio",
+    "bevy_color",
+    "bevy_core_pipeline",
+    "bevy_gilrs",
+    "bevy_render",
+    "bevy_sprite",
+    "bevy_state",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_winit",
+    "default_font",
+    "multi_threaded",
+    "tonemapping_luts",
+    "x11",
+] }
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
@@ -28,7 +50,7 @@ serde_json = "1"
 # XWayland.  Linux-only: the feature pulls Wayland deps that don't belong in
 # the Android build.  Cargo unions these features with the base `bevy` dep.
 [target.'cfg(target_os = "linux")'.dependencies]
-bevy = { version = "0.14", features = ["wayland"] }
+bevy = { version = "0.14", default-features = false, features = ["wayland"] }
 
 # Note: Bevy 0.14's winit uses NativeActivity by default (the switchable
 # `android-native-activity` / `android-game-activity` features only exist from
@@ -42,9 +64,13 @@ opt-level = 1
 opt-level = 3
 
 # Strip symbols from release builds — keeps the Android .so (and the desktop
-# binary) from shipping ~hundreds of MB of debug info.
+# binary) from shipping ~hundreds of MB of debug info.  Thin LTO + a single
+# codegen unit trade release-build time for a faster, smaller binary; safe on
+# all three targets (desktop bin, Android cdylib, iOS staticlib).
 [profile.release]
 strip = true
+lto = "thin"
+codegen-units = 1
 
 # ── Android packaging (cargo-apk) ──────────────────────────────────────────
 [package.metadata.android]
@@ -52,6 +78,9 @@ package = "org.zombiegame2.game"
 apk_name = "zombiegame2"
 # Bundle the asset folder (font etc.) into the APK so AssetServer can read it.
 assets = "assets"
+# Android resource dir (compiled by aapt).  Holds the launcher-icon mipmaps —
+# regenerate them from icon-src.svg with `tools/gen-icon.sh`.
+resources = "res"
 # arm64 = real phones; x86_64 = the Android emulator on a PC.  Building both
 # makes one universal APK that installs on either.  Drop x86_64 for a leaner
 # release once you no longer need emulator testing.
@@ -63,6 +92,8 @@ target_sdk_version = 34
 
 [package.metadata.android.application]
 label = "Zombies"
+# Launcher icon — resolved against res/mipmap-*/ic_launcher.png by aapt.
+icon = "@mipmap/ic_launcher"
 
 # Top-down twin-stick is designed for a wide view — lock to landscape.
 [package.metadata.android.application.activity]

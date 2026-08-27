@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Launcher icon source for the Android build.  Rasterised to the mipmap
+     densities by tools/gen-icon.sh.  Bold zombie head so it reads at 48px. -->
+<svg width="192" height="192" viewBox="0 0 192 192" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e4733"/>
+      <stop offset="1" stop-color="#0a140d"/>
+    </linearGradient>
+    <linearGradient id="skin" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7cc154"/>
+      <stop offset="1" stop-color="#4f8a32"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect x="0" y="0" width="192" height="192" rx="42" fill="url(#bg)"/>
+  <rect x="4" y="4" width="184" height="184" rx="38" fill="none"
+        stroke="#0a140d" stroke-width="3" opacity="0.5"/>
+
+  <!-- Head -->
+  <ellipse cx="96" cy="99" rx="55" ry="57" fill="url(#skin)"
+           stroke="#26401a" stroke-width="6"/>
+  <!-- Rot patches for texture -->
+  <ellipse cx="69" cy="128" rx="11" ry="8" fill="#3f6e28" opacity="0.7"/>
+  <ellipse cx="124" cy="120" rx="9" ry="7" fill="#3f6e28" opacity="0.6"/>
+  <ellipse cx="118" cy="64" rx="7" ry="5" fill="#3f6e28" opacity="0.6"/>
+
+  <!-- Forehead stitches -->
+  <g stroke="#1d3211" stroke-width="3" stroke-linecap="round">
+    <line x1="84" y1="70" x2="110" y2="66"/>
+    <line x1="88" y1="63" x2="86" y2="73"/>
+    <line x1="97" y1="61" x2="95" y2="71"/>
+    <line x1="106" y1="60" x2="104" y2="70"/>
+  </g>
+
+  <!-- Heavy brow -->
+  <path d="M62 84 q14 -9 30 -4 l-2 7 q-13 -4 -26 4 z" fill="#2c4a1d"/>
+
+  <!-- Left eye: wide, bloodshot, alive -->
+  <circle cx="80" cy="97" r="14" fill="#eef5df" stroke="#26401a" stroke-width="3"/>
+  <circle cx="83" cy="99" r="6" fill="#101a0c"/>
+  <g stroke="#c43a32" stroke-width="1.6" opacity="0.8" stroke-linecap="round">
+    <line x1="70" y1="93" x2="77" y2="96"/>
+    <line x1="71" y1="103" x2="78" y2="100"/>
+  </g>
+
+  <!-- Right eye: stitched shut (dead) -->
+  <g stroke="#1d3211" stroke-width="4" stroke-linecap="round">
+    <line x1="108" y1="92" x2="128" y2="100"/>
+    <line x1="112" y1="88" x2="110" y2="98"/>
+    <line x1="119" y1="91" x2="117" y2="101"/>
+    <line x1="126" y1="95" x2="124" y2="104"/>
+  </g>
+
+  <!-- Mouth: dark gash with teeth -->
+  <path d="M66 126 q30 18 60 2 q-6 16 -30 16 q-22 0 -30 -18 z" fill="#1a2c0e"/>
+  <g fill="#eef5df">
+    <rect x="74" y="128" width="7" height="9" rx="1.5"/>
+    <rect x="86" y="131" width="7" height="10" rx="1.5"/>
+    <rect x="99" y="131" width="7" height="10" rx="1.5"/>
+    <rect x="111" y="128" width="7" height="9" rx="1.5"/>
+  </g>
+
+  <!-- Blood drip from mouth -->
+  <path d="M101 146 q4 10 0 18 q-5 -4 -4 -11 q-1 -4 4 -7 z" fill="#bb2b2b"/>
+</svg>
