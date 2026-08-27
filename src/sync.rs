@@ -102,8 +102,18 @@ impl Plugin for NetSyncPlugin {
     }
 }
 
-fn reset_snapshot_history(mut history: ResMut<SnapshotHistory>) {
+fn reset_snapshot_history(
+    mut history: ResMut<SnapshotHistory>,
+    mut input_history: ResMut<InputHistory>,
+) {
     history.clear();
+    // Drop unacknowledged inputs from the finished round.  A fresh round-2
+    // player spawns with `last_processed_seq: 0`, so leftover entries (whose
+    // seqs are large — `next_seq` is monotonic across rounds) would never be
+    // trimmed by ack, and the reconciliation replay would drag the local
+    // player off spawn for the first frames of a rematch.  `next_seq` itself
+    // stays monotonic so a stale round-1 ack can never trim round-2 inputs.
+    input_history.buffer.clear();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -126,6 +136,10 @@ fn server_receive_inputs(
             events.push(e);
         }
     }
+    // One client can have shipped multiple input packets into a single drain
+    // (host frame hitch, clock jitter) — track which ids we've already seen
+    // this drain so one-shot flags can be OR-merged *within* the drain only.
+    let mut updated_this_drain: HashSet<u8> = HashSet::new();
     for e in events {
         match e {
             ServerEvent::Input { id, input } => {
@@ -134,13 +148,25 @@ fn server_receive_inputs(
                 // not feed to the simulation.
                 let mut merged = input;
                 merged.sanitize();
-                // Merge one-shot switch_slot to prevent lost inputs.
-                if merged.switch_slot == 0 {
-                    if let Some(prev) = remote.0.get(&id) {
+                if let Some(prev) = remote.0.get(&id) {
+                    // Merge one-shot switch_slot to prevent lost inputs —
+                    // sticky across ticks until the simulation consumes it.
+                    if merged.switch_slot == 0 {
                         merged.switch_slot = prev.switch_slot;
+                    }
+                    // Other one-shots (throw/reload/interact): merge ONLY
+                    // against packets from this same drain — the previous
+                    // tick's entry was already consumed by the simulation,
+                    // so OR-ing across ticks would double-fire grenade
+                    // throws, reloads and purchases.
+                    if updated_this_drain.contains(&id) {
+                        merged.throw |= prev.throw;
+                        merged.reload |= prev.reload;
+                        merged.interact |= prev.interact;
                     }
                 }
                 remote.0.insert(id, merged);
+                updated_this_drain.insert(id);
             }
             ServerEvent::Connected { id } => {
                 info!("Client {} connected mid-game (not spawning)", id);
@@ -188,6 +214,17 @@ struct BroadcastState {
     tick: u64,
 }
 
+/// Low-churn scalar world state bundled into one `SystemParam` so
+/// `server_broadcast_snapshot` keeps room under Bevy's 16-arg limit after
+/// gaining the explodables query.
+#[derive(SystemParam)]
+struct SnapshotMeta<'w> {
+    score: Res<'w, Score>,
+    segments: Res<'w, MapSegmentUnlockState>,
+    destroyed: Res<'w, crate::map::DestroyedExplodables>,
+    game_state: Res<'w, State<GameState>>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn server_broadcast_snapshot(
     ctx: Res<NetContext>,
@@ -199,18 +236,26 @@ fn server_broadcast_snapshot(
     armor_pickups: Query<(&Transform, &crate::net::NetId), With<ArmorPickup>>,
     money_pickups: Query<(&Transform, &crate::net::NetId, &MoneyMultPickup)>,
     explosions: Query<(&Transform, &crate::net::NetId, &Explosion)>,
-    score: Res<Score>,
+    explodables: Query<(&crate::map::Explodable, &crate::map::ExplodableObstacleIdx)>,
     wave: Res<WaveState>,
-    segments: Res<MapSegmentUnlockState>,
     nicknames: Res<PlayerNicknames>,
-    destroyed: Res<crate::map::DestroyedExplodables>,
-    game_state: Res<State<GameState>>,
+    meta: SnapshotMeta,
     mut bcast: Local<BroadcastState>,
 ) {
     let Some(host) = ctx.host.as_ref() else {
         return;
     };
     bcast.tick += 1;
+    // Nobody connected (solo-hosted lobby, or every client disconnected
+    // mid-match) — skip building + serializing a snapshot no one receives.
+    // Tick keeps counting so it stays monotonic.  Reset the delta-tracking
+    // state so the first snapshot once a client *is* connected (next round —
+    // mid-round joins are rejected) re-sends the full pickup/nickname fields.
+    if host.senders.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        bcast.last_pickup_ids.clear();
+        bcast.last_nicknames.clear();
+        return;
+    }
     let tick = bcast.tick;
     // Skip ticks per `SNAPSHOT_INTERVAL_TICKS` (currently 1 = 60 Hz), but
     // always send tick 1 so a client sees world state immediately on join.
@@ -331,6 +376,18 @@ fn server_broadcast_snapshot(
         Some(current_nicks)
     };
 
+    // Explodables that are hurt-but-alive: ship their visual damage stage so
+    // clients can smoke/burn the same wreck the host is.  Destroyed ones are
+    // already gone from this query (despawned on detonation) and travel in
+    // `destroyed_explodables` instead, so the two sets never overlap.
+    let damaged_explodables: Vec<(u32, u8)> = explodables
+        .iter()
+        .filter_map(|(expl, idx)| {
+            let stage = expl.damage_stage();
+            (stage >= 1).then_some((idx.0 as u32, stage))
+        })
+        .collect();
+
     let snap = NetSnapshot {
         tick,
         players: player_states,
@@ -338,15 +395,16 @@ fn server_broadcast_snapshot(
         bullets: bullet_states,
         pickups: pickups_field,
         explosions: explosion_states,
-        score: score.0,
+        score: meta.score.0,
         wave: wave.current_wave,
         in_break: wave.in_break,
         break_ms: (wave.break_timer.remaining_secs() * 1000.0).clamp(0.0, u16::MAX as f32) as u16,
         zombies_to_spawn: wave.zombies_to_spawn,
-        game_over: *game_state.get() == GameState::GameOver,
-        unlocked_segments_mask: segments.as_mask(),
+        game_over: *meta.game_state.get() == GameState::GameOver,
+        unlocked_segments_mask: meta.segments.as_mask(),
         player_nicknames: nicknames_field,
-        destroyed_explodables: destroyed.indices.iter().copied().collect(),
+        destroyed_explodables: meta.destroyed.indices.iter().copied().collect(),
+        damaged_explodables,
     };
 
     // Snapshots are identical for every client, so serialize once into a
@@ -524,6 +582,12 @@ fn client_apply_snapshots(
         (&mut Explosion, &mut Sprite),
         (Without<Player>, Without<Zombie>, Without<Bullet>),
     >,
+    // Smolder mirror — disjoint from every query above (touches neither
+    // Transform nor the marker components), so no archetype conflict.
+    mut explodable_vis: Query<(
+        &crate::map::ExplodableObstacleIdx,
+        &mut crate::map::ExplodableSmolder,
+    )>,
     mut next_state: ResMut<NextState<GameState>>,
     mut apply_ctx: SnapshotApplyCtx,
 ) {
@@ -612,33 +676,42 @@ fn client_apply_snapshots(
         return;
     };
     let latest_tick = latest_entry.snap.tick;
+    // Snapshots arrive at 60 Hz but this system runs once per render frame
+    // (120 Hz displays are common on the mobile targets).  Everything derived
+    // purely from the latest snapshot's *content* — scalar state, the
+    // reconciliation replay, spawns/despawns, lifecycle mirrors — is
+    // identical until a new snapshot lands, so it's gated on `has_new`; only
+    // the render-time interpolation writes stay on the per-frame path.
+    let has_new = latest_tick > history.last_applied_tick;
 
     // ── 3. Apply scalar wave/score state from latest ──────────────────────
     let lifecycle = latest_entry.snap.as_ref();
-    score.0 = lifecycle.score;
-    wave.current_wave = lifecycle.wave;
-    wave.in_break = lifecycle.in_break;
-    wave.zombies_to_spawn = lifecycle.zombies_to_spawn;
-    wave.break_timer = Timer::from_seconds(
-        ((lifecycle.break_ms as f32) / 1000.0).max(0.01),
-        TimerMode::Once,
-    );
-    segments.apply_mask(lifecycle.unlocked_segments_mask);
-    // Nicknames: None ⇒ unchanged, keep what we have.  Some(list) ⇒ rebuild.
-    if let Some(nicks) = lifecycle.player_nicknames.as_ref() {
-        nicknames.0.clear();
-        for (id, n) in nicks {
-            nicknames.0.insert(*id, n.clone());
+    if has_new {
+        score.0 = lifecycle.score;
+        wave.current_wave = lifecycle.wave;
+        wave.in_break = lifecycle.in_break;
+        wave.zombies_to_spawn = lifecycle.zombies_to_spawn;
+        wave.break_timer = Timer::from_seconds(
+            ((lifecycle.break_ms as f32) / 1000.0).max(0.01),
+            TimerMode::Once,
+        );
+        segments.apply_mask(lifecycle.unlocked_segments_mask);
+        // Nicknames: None ⇒ unchanged, keep what we have.  Some(list) ⇒ rebuild.
+        if let Some(nicks) = lifecycle.player_nicknames.as_ref() {
+            nicknames.0.clear();
+            for (id, n) in nicks {
+                nicknames.0.insert(*id, n.clone());
+            }
         }
-    }
-    // Destroyed explodables: full set on every snapshot, so a join-in-progress
-    // client catches up instantly.  We only write when the wire set differs
-    // from local — `is_changed` then triggers the cleanup system in map.rs
-    // to despawn matching entities + zero their obstacle shape.
-    let mut wire_set: HashSet<u32> =
-        lifecycle.destroyed_explodables.iter().copied().collect();
-    if wire_set != destroyed.indices {
-        std::mem::swap(&mut destroyed.indices, &mut wire_set);
+        // Destroyed explodables: full set on every snapshot, so a join-in-progress
+        // client catches up instantly.  We only write when the wire set differs
+        // from local — `is_changed` then triggers the cleanup system in map.rs
+        // to despawn matching entities + zero their obstacle shape.
+        let mut wire_set: HashSet<u32> =
+            lifecycle.destroyed_explodables.iter().copied().collect();
+        if wire_set != destroyed.indices {
+            std::mem::swap(&mut destroyed.indices, &mut wire_set);
+        }
     }
 
     // ── 4. Find interpolation pair for remote-entity poses ────────────────
@@ -687,24 +760,37 @@ fn client_apply_snapshots(
 
     // ── 5. Players: lifecycle + interpolated remote positions ─────────────
     let my_id = ctx.my_id;
-    scratch.seen_players.clear();
+    if has_new {
+        scratch.seen_players.clear();
+    }
     for np in &lifecycle.players {
-        scratch.seen_players.insert(np.id);
+        if has_new {
+            scratch.seen_players.insert(np.id);
+        }
         match net_entities.players.get(&np.id).copied() {
             Some(ent) => {
                 if let Ok((mut t, mut p, mut lp)) = players.get_mut(ent) {
-                    p.hp = np.hp as i32;
-                    p.armor = np.armor as i32;
-                    p.active_slot = np.active_slot;
-                    if np.slot1_weapon == 255 {
-                        p.slots[1] = None;
-                    } else {
-                        p.slots[1] = Some(Weapon::from_u8(np.slot1_weapon));
+                    if has_new {
+                        p.hp = np.hp as i32;
+                        p.armor = np.armor as i32;
+                        p.active_slot = np.active_slot;
+                        if np.slot1_weapon == 255 {
+                            p.slots[1] = None;
+                        } else {
+                            p.slots[1] = Some(Weapon::from_u8(np.slot1_weapon));
+                        }
                     }
                     let nx = dq_pos(np.x);
                     let ny = dq_pos(np.y);
 
                     if np.id == my_id {
+                        // Between snapshots the local player is advanced by
+                        // `client_local_predict` (FixedUpdate) + the LogicalPos
+                        // render interpolation — reconciliation only has new
+                        // information to act on when a snapshot arrived.
+                        if !has_new {
+                            continue;
+                        }
                         // Local player: ack-based reconciliation.  Drop
                         // already-processed inputs from history, snap to the
                         // server's authoritative position, then replay the
@@ -765,40 +851,47 @@ fn client_apply_snapshots(
                 }
             }
             None => {
-                let pos = Vec2::new(dq_pos(np.x), dq_pos(np.y));
-                let ent = spawn_player_entity(&mut commands, &assets.player, np.id, pos);
-                // Only the local player gets a LogicalPos — remote players
-                // are interpolated solely via the snapshot history buffer.
-                if np.id == my_id {
-                    commands.entity(ent).insert(LogicalPos::at(pos));
+                if has_new {
+                    let pos = Vec2::new(dq_pos(np.x), dq_pos(np.y));
+                    let ent = spawn_player_entity(&mut commands, &assets.player, np.id, pos);
+                    // Only the local player gets a LogicalPos — remote players
+                    // are interpolated solely via the snapshot history buffer.
+                    if np.id == my_id {
+                        commands.entity(ent).insert(LogicalPos::at(pos));
+                    }
+                    net_entities.players.insert(np.id, ent);
                 }
-                net_entities.players.insert(np.id, ent);
             }
         }
     }
-    // Before tearing down stale player entities, capture their last-known
-    // pose so we can fire `PlayerDiedEvent` — the death-animation listener
-    // turns it into a corpse sprite.  Without this, MP clients would just
-    // see other players pop out of existence with no visual cue.
-    for (&id, ent) in net_entities.players.iter() {
-        if scratch.seen_players.contains(&id) {
-            continue;
+    if has_new {
+        // Before tearing down stale player entities, capture their last-known
+        // pose so we can fire `PlayerDiedEvent` — the death-animation listener
+        // turns it into a corpse sprite.  Without this, MP clients would just
+        // see other players pop out of existence with no visual cue.
+        for (&id, ent) in net_entities.players.iter() {
+            if scratch.seen_players.contains(&id) {
+                continue;
+            }
+            if let Ok((t, p, _)) = players.get_mut(*ent) {
+                died_evw.send(PlayerDiedEvent {
+                    player_id: id,
+                    pos: t.translation.truncate(),
+                    aim_rot: p.aim.y.atan2(p.aim.x),
+                });
+            }
         }
-        if let Ok((t, p, _)) = players.get_mut(*ent) {
-            died_evw.send(PlayerDiedEvent {
-                player_id: id,
-                pos: t.translation.truncate(),
-                aim_rot: p.aim.y.atan2(p.aim.x),
-            });
-        }
+        despawn_stale(&mut commands, &mut net_entities.players, &scratch.seen_players);
     }
-    despawn_stale(&mut commands, &mut net_entities.players, &scratch.seen_players);
 
     // ── 6. Zombies: interpolated positions, snapped rotation ──────────────
-    scratch.seen_zombies.clear();
+    if has_new {
+        scratch.seen_zombies.clear();
+    }
     for nz in &lifecycle.zombies {
-        scratch.seen_zombies.insert(nz.id);
-        let kind = ZombieKind::from_u8(nz.kind);
+        if has_new {
+            scratch.seen_zombies.insert(nz.id);
+        }
         match net_entities.zombies.get(&nz.id).copied() {
             Some(ent) => {
                 if let Ok((mut t, mut zomb)) = zombies.get_mut(ent) {
@@ -813,35 +906,46 @@ fn client_apply_snapshots(
                     t.rotation = Quat::from_rotation_z(dq_rot(nz.rot));
                     // Mirror authoritative HP — drives the giant HP bar
                     // and any future per-zombie health overlays.
-                    zomb.hp = nz.hp as i32;
+                    if has_new {
+                        zomb.hp = nz.hp as i32;
+                    }
                 }
             }
             None => {
-                let ent = spawn_zombie_entity(
-                    &mut commands,
-                    &assets.zombie,
-                    Vec2::new(dq_pos(nz.x), dq_pos(nz.y)),
-                    nz.id,
-                    nz.hp as i32,
-                    kind.base_speed(),
-                    kind,
-                );
-                net_entities.zombies.insert(nz.id, ent);
-                // Newly-appearing Giant on the wire: fire the boss-alert
-                // event locally so the UI flash plays on every client, not
-                // just the host where the spawn listener ran.
-                if matches!(kind, ZombieKind::Giant) {
-                    boss_spawn_evw.send(crate::zombie::SpawnZombieEvent { kind });
+                if has_new {
+                    let kind = ZombieKind::from_u8(nz.kind);
+                    let ent = spawn_zombie_entity(
+                        &mut commands,
+                        &assets.zombie,
+                        Vec2::new(dq_pos(nz.x), dq_pos(nz.y)),
+                        nz.id,
+                        nz.hp as i32,
+                        kind.base_speed(),
+                        kind,
+                    );
+                    net_entities.zombies.insert(nz.id, ent);
+                    // Newly-appearing Giant on the wire: fire the boss-alert
+                    // event locally so the UI flash plays on every client, not
+                    // just the host where the spawn listener ran.
+                    if matches!(kind, ZombieKind::Giant) {
+                        boss_spawn_evw.send(crate::zombie::SpawnZombieEvent { kind });
+                    }
                 }
             }
         }
     }
-    despawn_stale(&mut commands, &mut net_entities.zombies, &scratch.seen_zombies);
+    if has_new {
+        despawn_stale(&mut commands, &mut net_entities.zombies, &scratch.seen_zombies);
+    }
 
     // ── 7. Bullets: interpolated positions ────────────────────────────────
-    scratch.seen_bullets.clear();
+    if has_new {
+        scratch.seen_bullets.clear();
+    }
     for nb in &lifecycle.bullets {
-        scratch.seen_bullets.insert(nb.id);
+        if has_new {
+            scratch.seen_bullets.insert(nb.id);
+        }
         match net_entities.bullets.get(&nb.id).copied() {
             Some(ent) => {
                 if let Ok(mut t) = bullets.get_mut(ent) {
@@ -857,33 +961,38 @@ fn client_apply_snapshots(
                 }
             }
             None => {
-                let rot = dq_rot(nb.rot);
-                let ent = spawn_bullet_entity(
-                    &mut commands,
-                    &assets.bullet,
-                    Vec2::new(dq_pos(nb.x), dq_pos(nb.y)),
-                    Vec2::new(rot.cos(), rot.sin()),
-                    0.0,
-                    0,
-                    nb.id,
-                    nb.is_rocket,
-                    false,
-                    None,
-                    false,
-                    0, // shooter_id — irrelevant on the client side, no auth hit-test runs here.
-                );
-                net_entities.bullets.insert(nb.id, ent);
+                if has_new {
+                    let rot = dq_rot(nb.rot);
+                    let ent = spawn_bullet_entity(
+                        &mut commands,
+                        &assets.bullet,
+                        Vec2::new(dq_pos(nb.x), dq_pos(nb.y)),
+                        Vec2::new(rot.cos(), rot.sin()),
+                        0.0,
+                        0,
+                        nb.id,
+                        nb.is_rocket,
+                        false,
+                        None,
+                        false,
+                        0, // shooter_id — irrelevant on the client side, no auth hit-test runs here.
+                    );
+                    net_entities.bullets.insert(nb.id, ent);
+                }
             }
         }
     }
-    despawn_stale(&mut commands, &mut net_entities.bullets, &scratch.seen_bullets);
+    if has_new {
+        despawn_stale(&mut commands, &mut net_entities.bullets, &scratch.seen_bullets);
+    }
 
     // ── 8. Pickups: spawn-only (static positions) ─────────────────────────
     // Skip the whole section when host signalled "no change" (None).  Without
     // this guard `despawn_stale` would clear every pickup the moment we get
     // a delta snapshot — they aren't in `lifecycle.pickups` because the host
-    // omitted the field.
-    if let Some(snap_pickups) = lifecycle.pickups.as_ref() {
+    // omitted the field.  Also skipped when no new snapshot arrived this
+    // frame — the field's content can't have changed since the last apply.
+    if let Some(snap_pickups) = lifecycle.pickups.as_ref().filter(|_| has_new) {
     scratch.seen_pickups.clear();
     for np in snap_pickups {
         scratch.seen_pickups.insert(np.id);
@@ -933,6 +1042,12 @@ fn client_apply_snapshots(
     despawn_stale(&mut commands, &mut net_entities.pickups, &scratch.seen_pickups);
     } // end "if let Some(snap_pickups)"
 
+    // Everything below only reacts to snapshot *content* — skip it entirely
+    // on frames where no new snapshot arrived.
+    if !has_new {
+        return;
+    }
+
     // ── 9. Explosions: anim state from latest ─────────────────────────────
     scratch.seen_explosions.clear();
     for ne in &lifecycle.explosions {
@@ -963,6 +1078,19 @@ fn client_apply_snapshots(
         }
     }
     despawn_stale(&mut commands, &mut net_entities.explosions, &scratch.seen_explosions);
+
+    // ── Explodable smolder: mirror the host's per-wreck damage stage so a
+    // car the host shows smoking/burning looks the same on our screen.  Any
+    // explodable absent from the wire list is intact (stage 0); destroyed
+    // ones are handled separately via `destroyed_explodables`.
+    let damaged: std::collections::HashMap<u32, u8> =
+        lifecycle.damaged_explodables.iter().copied().collect();
+    for (idx, mut sm) in explodable_vis.iter_mut() {
+        let stage = damaged.get(&(idx.0 as u32)).copied().unwrap_or(0);
+        if sm.stage != stage {
+            sm.stage = stage;
+        }
+    }
 
     if lifecycle.game_over {
         next_state.set(GameState::GameOver);

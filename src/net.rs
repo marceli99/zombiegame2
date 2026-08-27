@@ -27,7 +27,7 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Network protocol version — bumped on any wire-format change.  Clients with
 /// a mismatched version are rejected at connect time so they don't trigger
 /// `bincode::deserialize` panics on a wrong-shape struct.
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 /// Hard limit on a single chat line.  80 chars is wide enough to be useful
 /// without enabling spam.  Enforced on both the client send path and the
@@ -224,6 +224,12 @@ pub struct NetSnapshot {
     /// joining mid-game catches up immediately.  Tiny on the wire — at
     /// most ~30 entries × 4 B in a long match.
     pub destroyed_explodables: Vec<u32>,
+    /// `(obstacle_idx, stage)` for explodables that are damaged but not yet
+    /// destroyed: `stage` 1 = smoking, 2 = burning (close to detonation).
+    /// Lets remote clients show a wreck smoking then catching fire as it
+    /// nears its blast.  Empty until something actually takes a hit, so it
+    /// costs nothing on the wire most of the match.
+    pub damaged_explodables: Vec<(u32, u8)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug)]
@@ -596,6 +602,18 @@ pub fn start_host() -> std::io::Result<HostConn> {
 
             let (out_tx, out_rx) = channel::<OutMsg>();
             senders_clone.lock().unwrap_or_else(|e| e.into_inner()).insert(id, out_tx);
+            // Re-check the in-game flag now that the sender is registered.
+            // `StartGame` may have been broadcast between the pre-Welcome
+            // check above and this insert — this client wasn't in `senders`
+            // yet, so it never received it and would sit wedged in the lobby
+            // forever.  Back out completely: free the slot, reject, and skip
+            // Connected/Hello so the host never half-registers the player.
+            if in_game_clone.load(Ordering::Relaxed) {
+                senders_clone.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                let _ = write_msg(&mut handshake_stream, &ServerMsg::GameInProgress);
+                let _ = handshake_stream.shutdown(std::net::Shutdown::Both);
+                continue;
+            }
             let _ = event_tx_clone.send(ServerEvent::Connected { id });
             let _ = event_tx_clone.send(ServerEvent::Hello {
                 id,
@@ -828,6 +846,15 @@ pub fn start_client(addr: SocketAddr, nickname: &str) -> std::io::Result<ClientC
 }
 
 pub fn broadcast(host: &HostConn, msg: &ServerMsg) {
+    // `StartGame` on the wire means the round is live *now* — flip the
+    // in-game flag before iterating senders so a joiner whose handshake
+    // completes between this broadcast and `OnEnter(Playing)` (which runs
+    // `set_host_in_game` a frame-plus later) is rejected with
+    // `GameInProgress` instead of being welcomed into a lobby that will
+    // never send it `StartGame` again.
+    if matches!(msg, ServerMsg::StartGame) {
+        host.in_game.store(true, Ordering::Relaxed);
+    }
     let senders = host.senders.lock().unwrap_or_else(|e| e.into_inner());
     for tx in senders.values() {
         let _ = tx.send(OutMsg::Msg(msg.clone()));
