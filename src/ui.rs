@@ -11,7 +11,7 @@ use crate::player::{
 use crate::settings::GraphicsSettings;
 use crate::wave::WaveState;
 use crate::zombie::{SpawnZombieEvent, ZombieKilledEvent, ZombieKind};
-use crate::weapon::{PickupPromptHint, ThrowableAssets, ThrowableKind, WeaponAssets};
+use crate::weapon::{PickupPromptHint, ThrowableAssets, ThrowableKind, Weapon, WeaponAssets};
 use crate::zombie::Zombie;
 use crate::{GameState, Score, UiAssets};
 
@@ -1070,11 +1070,19 @@ fn update_hud(
     let hp_pct = (player.hp.max(0) as f32 / PLAYER_MAX_HP as f32 * 100.0).clamp(0.0, 100.0);
     let armor_pct = (player.armor.max(0) as f32 / PLAYER_ARMOR_MAX as f32 * 100.0)
         .clamp(0.0, 100.0);
+    // Compare before writing — an unchanged bar must not dirty `Style`,
+    // since any `Mut` deref marks it changed and re-runs UI layout.
+    let hp_width = Val::Percent(hp_pct);
     if let Ok(mut style) = bars.p0().get_single_mut() {
-        style.width = Val::Percent(hp_pct);
+        if style.width != hp_width {
+            style.width = hp_width;
+        }
     }
+    let armor_width = Val::Percent(armor_pct);
     if let Ok(mut style) = bars.p1().get_single_mut() {
-        style.width = Val::Percent(armor_pct);
+        if style.width != armor_width {
+            style.width = armor_width;
+        }
     }
     let hp_now = player.hp.max(0);
     if cache.hp != Some(hp_now) {
@@ -1523,6 +1531,7 @@ fn update_damage_overlay(
 #[allow(clippy::type_complexity)]
 fn update_pickup_prompt(
     hint: Res<PickupPromptHint>,
+    mut last: Local<Option<Weapon>>,
     mut root: Query<&mut Visibility, (With<PickupPromptRoot>, Without<PickupPromptText>)>,
     mut text_q: Query<&mut Text, With<PickupPromptText>>,
 ) {
@@ -1532,14 +1541,20 @@ fn update_pickup_prompt(
     match hint.weapon {
         Some(w) => {
             *vis = Visibility::Inherited;
-            if let Ok(mut text) = text_q.get_single_mut() {
-                text.sections[0].value = format!("[E] PICK UP - {}", w.label());
+            // Only re-format when the hinted weapon changed — the string is
+            // identical frame after frame while the prompt is up, and
+            // writing `Text` re-runs glyph layout even for an equal value.
+            if *last != Some(w) {
+                if let Ok(mut text) = text_q.get_single_mut() {
+                    text.sections[0].value = format!("[E] PICK UP - {}", w.label());
+                }
             }
         }
         None => {
             *vis = Visibility::Hidden;
         }
     }
+    *last = hint.weapon;
 }
 
 /// Toggles the floor indicator visibility based on whether the local
@@ -1548,6 +1563,7 @@ fn update_pickup_prompt(
 #[allow(clippy::type_complexity)]
 fn update_floor_indicator(
     floor_state: Res<PlayerFloorState>,
+    mut last: Local<Option<(usize, u8)>>,
     mut root: Query<&mut Visibility, (With<FloorIndicatorRoot>, Without<FloorIndicatorText>)>,
     mut text_q: Query<&mut Text, With<FloorIndicatorText>>,
 ) {
@@ -1557,26 +1573,33 @@ fn update_floor_indicator(
     match floor_state.building {
         Some(b_idx) => {
             *vis = Visibility::Inherited;
-            let kind = BUILDINGS[b_idx].kind;
-            let total = building_floor_count(kind);
-            // Translate the numeric floor index into a human label so the
-            // ground floor reads "PARTER" (typical Polish convention).
-            let label = match floor_state.floor {
-                0 => "PARTER".to_string(),
-                f if f as u8 + 1 == total => "DACH".to_string(),
-                f => format!("{} PIETRO", f),
-            };
-            if let Ok(mut text) = text_q.get_single_mut() {
-                text.sections[0].value = format!(
-                    "{}  ({}/{})  - E aby zmienic",
-                    label,
-                    floor_state.floor + 1,
-                    total,
-                );
+            // Only re-format when (building, floor) changed — the label is
+            // stable while the player stays on the same storey.
+            let key = Some((b_idx, floor_state.floor));
+            if *last != key {
+                let kind = BUILDINGS[b_idx].kind;
+                let total = building_floor_count(kind);
+                // Translate the numeric floor index into a human label so the
+                // ground floor reads "PARTER" (typical Polish convention).
+                let label = match floor_state.floor {
+                    0 => "PARTER".to_string(),
+                    f if f as u8 + 1 == total => "DACH".to_string(),
+                    f => format!("{} PIETRO", f),
+                };
+                if let Ok(mut text) = text_q.get_single_mut() {
+                    text.sections[0].value = format!(
+                        "{}  ({}/{})  - E aby zmienic",
+                        label,
+                        floor_state.floor + 1,
+                        total,
+                    );
+                }
             }
+            *last = key;
         }
         None => {
             *vis = Visibility::Hidden;
+            *last = None;
         }
     }
 }
@@ -1638,6 +1661,7 @@ fn update_player_list(
     net: Res<NetMode>,
     nicknames: Res<PlayerNicknames>,
     players: Query<&Player>,
+    mut ids: Local<Vec<u8>>,
     mut root: Query<
         &mut Visibility,
         (
@@ -1659,60 +1683,80 @@ fn update_player_list(
     mut hp_fills: Query<(&PlayerListHpFill, &mut Style)>,
 ) {
     let multiplayer = matches!(*net, NetMode::Host | NetMode::Client);
+    // All writes below are compare-gated: a `Mut` deref marks the component
+    // changed even for an equal value, which would keep text glyph layout
+    // and UI layout hot every frame for content that almost never changes.
     if let Ok(mut vis) = root.get_single_mut() {
-        *vis = if multiplayer {
+        let want = if multiplayer {
             Visibility::Inherited
         } else {
             Visibility::Hidden
         };
+        if *vis != want {
+            *vis = want;
+        }
     }
     if !multiplayer {
         return;
     }
 
     // Build a quick lookup: slot index → matching player id, looking by sort
-    // order of player ids so layout is stable across frames.
-    let mut ids: Vec<u8> = players.iter().map(|p| p.id).collect();
+    // order of player ids so layout is stable across frames.  The buffer is
+    // a `Local` so the per-frame rebuild doesn't allocate.
+    ids.clear();
+    ids.extend(players.iter().map(|p| p.id));
     ids.sort_unstable();
 
     for (slot_marker, mut vis) in slots.iter_mut() {
-        let active = (slot_marker.slot as usize) < ids.len();
-        *vis = if active {
+        let want = if (slot_marker.slot as usize) < ids.len() {
             Visibility::Inherited
         } else {
             Visibility::Hidden
         };
+        if *vis != want {
+            *vis = want;
+        }
     }
     // Update text + HP fill per slot.
     for (n, mut text) in nick_texts.iter_mut() {
         if let Some(&id) = ids.get(n.slot as usize) {
-            let nick = nicknames
-                .0
-                .get(&id)
-                .cloned()
-                .unwrap_or_else(|| format!("P{}", id));
-            text.sections[0].value = nick;
-        } else {
+            // Compare against the current value first so the clone/format
+            // only happens when the nickname actually changed.
+            if let Some(nick) = nicknames.0.get(&id) {
+                if text.sections[0].value != *nick {
+                    text.sections[0].value = nick.clone();
+                }
+            } else {
+                let fallback = format!("P{}", id);
+                if text.sections[0].value != fallback {
+                    text.sections[0].value = fallback;
+                }
+            }
+        } else if !text.sections[0].value.is_empty() {
             text.sections[0].value.clear();
         }
     }
     for (hp_fill, mut style) in hp_fills.iter_mut() {
-        if let Some(&id) = ids.get(hp_fill.slot as usize) {
+        let want = if let Some(&id) = ids.get(hp_fill.slot as usize) {
             let hp = players
                 .iter()
                 .find(|p| p.id == id)
                 .map(|p| p.hp.max(0))
                 .unwrap_or(0);
             let frac = (hp as f32 / PLAYER_MAX_HP as f32).clamp(0.0, 1.0);
-            style.width = Val::Percent(frac * 100.0);
+            Val::Percent(frac * 100.0)
         } else {
-            style.width = Val::Percent(0.0);
+            Val::Percent(0.0)
+        };
+        if style.width != want {
+            style.width = want;
         }
     }
 }
 
 fn update_segment_prompt(
     hint: Res<SegmentUnlockHint>,
+    mut last: Local<Option<(u8, u32, bool)>>,
     mut roots: Query<&mut Visibility, With<SegmentPromptRoot>>,
     mut texts: Query<&mut Text, With<SegmentPromptText>>,
 ) {
@@ -1725,18 +1769,25 @@ fn update_segment_prompt(
     match hint.segment_idx {
         Some(idx) => {
             *vis = Visibility::Inherited;
-            let label = segment_name(idx);
-            let section = &mut text.sections[0];
-            if hint.affordable {
-                section.value = format!("[E]  ODBLOKUJ {label}  -  ${}", hint.cost);
-                section.style.color = Color::srgba(0.55, 0.95, 0.4, 1.0);
-            } else {
-                section.value = format!("BRAK $$$  -  {label}  KOSZT  ${}", hint.cost);
-                section.style.color = Color::srgba(0.92, 0.45, 0.32, 1.0);
+            // Only re-format when the target/cost/affordability changed —
+            // the string and color are stable frame to frame otherwise.
+            let key = Some((idx, hint.cost, hint.affordable));
+            if *last != key {
+                let label = segment_name(idx);
+                let section = &mut text.sections[0];
+                if hint.affordable {
+                    section.value = format!("[E]  ODBLOKUJ {label}  -  ${}", hint.cost);
+                    section.style.color = Color::srgba(0.55, 0.95, 0.4, 1.0);
+                } else {
+                    section.value = format!("BRAK $$$  -  {label}  KOSZT  ${}", hint.cost);
+                    section.style.color = Color::srgba(0.92, 0.45, 0.32, 1.0);
+                }
             }
+            *last = key;
         }
         None => {
             *vis = Visibility::Hidden;
+            *last = None;
         }
     }
 }

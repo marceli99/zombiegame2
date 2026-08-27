@@ -345,27 +345,27 @@ fn chat_render_overlay(
     mut input_text: Query<&mut Text, (With<ChatInputText>, Without<ChatHistoryLine>)>,
 ) {
     // Render history bottom-up so newest sits closest to the input box.
-    let visible: Vec<&ChatLine> = log
-        .lines
-        .iter()
-        .rev()
-        .take(MAX_LINES)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    let count = visible.len();
+    // Only write to a `Text` when its content actually changes — a mutable
+    // deref marks the component `Changed` and re-triggers text shaping and
+    // UI layout every frame, a constant background cost on mobile.
+    let count = log.lines.len().min(MAX_LINES);
 
     for (line_marker, mut text) in history.iter_mut() {
         // Slot 0 is the bottom-most rendered line; slot N-1 is at the top.
         // We want newest at the bottom, so map slot i → visible[count-1-i].
         let idx_from_top = MAX_LINES - 1 - line_marker.slot;
         if idx_from_top >= count {
-            text.sections[0].value.clear();
-            text.sections[0].style.color = Color::srgba(0.0, 0.0, 0.0, 0.0);
+            // Blank slots stay transparent whenever the value is empty, so
+            // one guard covers both writes.
+            if !text.sections[0].value.is_empty() {
+                text.sections[0].value.clear();
+                text.sections[0].style.color = Color::srgba(0.0, 0.0, 0.0, 0.0);
+            }
             continue;
         }
-        let line = visible[count - 1 - idx_from_top];
+        // Newest line sits at the back of the deque, so index from the back
+        // directly instead of collecting a reversed snapshot per frame.
+        let line = &log.lines[log.lines.len() - 1 - idx_from_top];
         // Stay open while typing so the player has full context; otherwise
         // fade out after the lifetime threshold.
         let alpha = if state.open {
@@ -377,26 +377,43 @@ fn chat_render_overlay(
             (remaining / 1.5).clamp(0.0, 1.0)
         };
         if alpha <= 0.005 {
-            text.sections[0].value.clear();
-            text.sections[0].style.color = Color::srgba(0.0, 0.0, 0.0, 0.0);
+            if !text.sections[0].value.is_empty() {
+                text.sections[0].value.clear();
+                text.sections[0].style.color = Color::srgba(0.0, 0.0, 0.0, 0.0);
+            }
             continue;
         }
-        text.sections[0].value = format!("{}: {}", line.author, line.text);
-        text.sections[0].style.color = Color::srgba(1.0, 0.95, 0.85, alpha);
+        // Outside the fade window alpha is a constant 1.0, so these guards
+        // skip the write on every frame where nothing moved.
+        let rendered = format!("{}: {}", line.author, line.text);
+        if text.sections[0].value != rendered {
+            text.sections[0].value = rendered;
+        }
+        let color = Color::srgba(1.0, 0.95, 0.85, alpha);
+        if text.sections[0].style.color != color {
+            text.sections[0].style.color = color;
+        }
     }
 
-    // Input box — visible only while typing.
+    // Input box — visible only while typing.  Same guarded writes so an
+    // idle overlay doesn't dirty the UI tree every frame.
     if let Ok(mut vis) = input_box.get_single_mut() {
-        *vis = if state.open {
+        let desired = if state.open {
             Visibility::Visible
         } else {
             Visibility::Hidden
         };
+        if *vis != desired {
+            *vis = desired;
+        }
     }
     if let Ok(mut text) = input_text.get_single_mut() {
         if state.open {
-            text.sections[0].value = format!("> {}_", state.buffer);
-        } else {
+            let rendered = format!("> {}_", state.buffer);
+            if text.sections[0].value != rendered {
+                text.sections[0].value = rendered;
+            }
+        } else if !text.sections[0].value.is_empty() {
             text.sections[0].value.clear();
         }
     }
