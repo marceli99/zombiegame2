@@ -5,3 +5,4 @@ target/
 web/pkg/
 web/assets/
 __pycache__/
+release.keystore
