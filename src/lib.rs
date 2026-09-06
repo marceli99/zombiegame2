@@ -88,7 +88,7 @@ pub fn mobile_profile() -> bool {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        cfg!(any(target_os = "android", target_os = "ios")) || dev_flag("force_touch")
+        dev_flag("force_touch")
     }
 }
 
@@ -155,8 +155,8 @@ pub fn gameplay_active(
     *pause.get() == PauseState::Running
 }
 
-/// Builds and runs the game.  Called by the desktop binary (`src/main.rs`) and
-/// by the Android entry point (`#[bevy_main]`, below).
+/// Builds and runs the game.  `src/main.rs` calls this — natively for the
+/// single-player dev build, and as the wasm-bindgen entry point on the web.
 pub fn run() {
     // Route Rust panics to the browser console with a readable stack trace
     // instead of an opaque "unreachable executed".
@@ -185,14 +185,10 @@ pub fn run() {
         .add(menu::build_vignette_image());
     app.insert_resource(UiAssets { font, vignette });
 
-    // MSAA crashes some Android GPUs/drivers; disable it there.  (Bevy's own
-    // mobile example does the same.)  Phone browsers sit on the same GPUs.
-    // Desktop/iOS keep the default 4× MSAA; `ZG_NO_MSAA` / `?no_msaa`
-    // previews the no-MSAA look anywhere.
-    if cfg!(target_os = "android")
-        || (cfg!(target_arch = "wasm32") && mobile_profile())
-        || dev_flag("no_msaa")
-    {
+    // Phone GPUs are tiled and bandwidth-bound and some drivers choke on
+    // MSAA outright, so phone browsers run without it; desktop keeps the
+    // default 4×.  `ZG_NO_MSAA` / `?no_msaa` previews the no-MSAA look.
+    if (cfg!(target_arch = "wasm32") && mobile_profile()) || dev_flag("no_msaa") {
         app.insert_resource(Msaa::Off);
     }
 
@@ -337,20 +333,13 @@ fn setup_camera(mut commands: Commands) {
     let mut camera = Camera2dBundle::default();
     camera.projection.scaling_mode = ScalingMode::FixedVertical(view_height());
 
-    // Mobile GPUs are tiled + bandwidth-bound and choke on HDR rendering, a
-    // multi-pass bloom, and a LUT-based tonemapper — and those features also
-    // raise the bar for obtaining a working render adapter at all.  So on
-    // Android/iOS we run a lean SDR profile: no HDR, no bloom, cheap (LUT-free)
-    // tonemapping; desktop keeps the full glow look.
-    //
-    // Using a runtime `cfg!()` flag (not `#[cfg]`) keeps BOTH paths compiled on
-    // every target, so the desktop build type-checks the mobile path too — and
-    // `ZG_LOW_GFX=1` lets you preview the lean look on desktop.
-    // Phone browsers get the lean profile too; a desktop browser keeps the
-    // full look (WebGL2 handles HDR + bloom fine).
-    let lean_gfx = cfg!(any(target_os = "android", target_os = "ios"))
-        || (cfg!(target_arch = "wasm32") && mobile_profile())
-        || dev_flag("low_gfx");
+    // Phone GPUs are tiled + bandwidth-bound and choke on HDR rendering, a
+    // multi-pass bloom, and a LUT-based tonemapper, so phone browsers run a
+    // lean SDR profile: no HDR, no bloom, cheap (LUT-free) tonemapping.  A
+    // desktop browser keeps the full glow look (WebGL2 handles HDR + bloom
+    // fine).  Both paths always compile; `ZG_LOW_GFX=1` / `?low_gfx`
+    // previews the lean look anywhere.
+    let lean_gfx = (cfg!(target_arch = "wasm32") && mobile_profile()) || dev_flag("low_gfx");
 
     if lean_gfx {
         camera.camera.hdr = false;
@@ -469,14 +458,4 @@ fn accumulate_camera_shake(
         let bump = ev.radius * 0.12 * proximity;
         shake.intensity = (shake.intensity + bump).min(28.0);
     }
-}
-
-/// Mobile entry point.  `#[bevy_main]` generates the platform glue the OS calls
-/// into — `android_main` (NDK NativeActivity) on Android and the C-callable
-/// `main_rs` (invoked from `ios/main.m`) on iOS.  Compiled only for those
-/// targets; on desktop the binary (`src/main.rs`) drives `run()` directly.
-#[cfg(any(target_os = "android", target_os = "ios"))]
-#[bevy_main]
-fn main() {
-    run();
 }

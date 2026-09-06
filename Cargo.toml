@@ -9,18 +9,9 @@ name = "zombiegame2"
 version = "0.1.0"
 edition = "2021"
 
-# The whole game is a library so the same code can be built for every target:
-#   rlib      -> linked by the desktop binary (`src/main.rs`)
-#   cdylib    -> Android NativeActivity (`#[bevy_main]` -> `android_main`)
-#   staticlib -> iOS app bundle (`#[bevy_main]` -> `main_rs`, linked by Xcode)
-[lib]
-name = "zombiegame2"
-crate-type = ["rlib", "cdylib", "staticlib"]
-
-[features]
-# Enable when building for the iOS *simulator* (`aarch64-apple-ios-sim` /
-# `x86_64-apple-ios`); `ios/build-rust.sh` passes this automatically.
-ios_sim = ["bevy/ios_simulator"]
+# The game is a library crate; `src/main.rs` is a thin entry point that
+# `build-web.sh` compiles to wasm (and that runs natively for single player
+# and the unit tests).
 
 [dependencies]
 # Trimmed feature set: everything the game touches (2D sprites, UI/text, states,
@@ -29,7 +20,6 @@ ios_sim = ["bevy/ios_simulator"]
 # drops gltf/pbr/scene/animation/gizmos and the png/hdr/vorbis asset loaders
 # from the build for faster compiles and a smaller binary on every platform.
 bevy = { version = "0.14", default-features = false, features = [
-    "android_shared_stdcxx",
     "bevy_asset",
     "bevy_audio",
     "bevy_color",
@@ -51,17 +41,11 @@ serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
 serde_json = "1"
 
-# `wayland` is additive on top of the default `x11` so the same binary runs
-# natively on both Xorg and Wayland sessions instead of falling back through
-# XWayland.  Linux-only: the feature pulls Wayland deps that don't belong in
-# the Android build.  Cargo unions these features with the base `bevy` dep.
+# `wayland` is additive on top of the default `x11` so the native dev build
+# runs on both Xorg and Wayland sessions instead of falling back through
+# XWayland.  Cargo unions these features with the base `bevy` dep.
 [target.'cfg(target_os = "linux")'.dependencies]
 bevy = { version = "0.14", default-features = false, features = ["wayland"] }
-
-# Note: Bevy 0.14's winit uses NativeActivity by default (the switchable
-# `android-native-activity` / `android-game-activity` features only exist from
-# 0.15), which is exactly what cargo-apk wraps the app in — so no extra Android
-# feature flag is needed here.
 
 [profile.dev]
 opt-level = 1
@@ -69,57 +53,13 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
-# Strip symbols from release builds — keeps the Android .so (and the desktop
-# binary) from shipping ~hundreds of MB of debug info.  Thin LTO + a single
-# codegen unit trade release-build time for a faster, smaller binary; safe on
-# all three targets (desktop bin, Android cdylib, iOS staticlib).
+# Strip symbols from release builds — keeps the .wasm (and the native binary)
+# from shipping ~hundreds of MB of debug info.  Thin LTO + a single codegen
+# unit trade release-build time for a faster, smaller binary.
 [profile.release]
 strip = true
 lto = "thin"
 codegen-units = 1
-
-# ── Android packaging (cargo-apk) ──────────────────────────────────────────
-[package.metadata.android]
-package = "org.zombiegame2.game"
-apk_name = "zombiegame2"
-# Bundle the asset folder (font etc.) into the APK so AssetServer can read it.
-assets = "assets"
-# Android resource dir (compiled by aapt).  Holds the launcher-icon mipmaps —
-# regenerate them from icon-src.svg with `tools/gen-icon.sh`.
-resources = "res"
-# arm64 = real phones; x86_64 = the Android emulator on a PC.  Building both
-# makes one universal APK that installs on either — but the x86_64 .so roughly
-# doubles the APK, and no real device uses it.  For a shipped release, drop
-# "x86_64-linux-android" from this list before running ./build-android.sh;
-# emulator testing is the only reason to keep it.
-build_targets = ["aarch64-linux-android", "x86_64-linux-android"]
-
-[package.metadata.android.sdk]
-min_sdk_version = 24
-target_sdk_version = 34
-
-[package.metadata.android.application]
-label = "Zombies"
-# Launcher icon — resolved against res/mipmap-*/ic_launcher.png by aapt.
-icon = "@mipmap/ic_launcher"
-
-# Top-down twin-stick is designed for a wide view — lock to landscape.
-[package.metadata.android.application.activity]
-orientation = "landscape"
-
-# LAN multiplayer needs network access.
-[[package.metadata.android.uses_permission]]
-name = "android.permission.INTERNET"
-
-# Release signing.  `release.keystore` is a local, self-signed, throwaway key
-# (git-ignored) — fine for sideloading.  For a Google Play upload, replace it
-# with a properly managed upload key.  Regenerate with:
-#   keytool -genkeypair -keystore release.keystore -alias zombie -keyalg RSA \
-#     -keysize 2048 -validity 10000 -storepass zombiegame -keypass zombiegame \
-#     -dname "CN=Zombiegame, O=Zombiegame, C=PL"
-[package.metadata.android.signing.release]
-path = "release.keystore"
-keystore_password = "zombiegame"
 
 # ── Web (wasm32-unknown-unknown) ───────────────────────────────────────────
 # Browser build.  `webgl2` picks the wgpu GL backend (WebGPU would need a

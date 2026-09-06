@@ -236,26 +236,8 @@ pub fn data_dir() -> Option<PathBuf> {
         });
     #[cfg(target_os = "windows")]
     let base = std::env::var("APPDATA").ok().map(PathBuf::from);
-    // iOS sets HOME to the app's sandbox container, so the macOS layout works
-    // (create_dir_all makes the Application Support subdir on first save).
-    #[cfg(target_os = "ios")]
-    let base = std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join("Library/Application Support"));
-    // Android: cwd is "/" and HOME is unset, so ask the NativeActivity handle
-    // (populated by `#[bevy_main]` before `App::run`) for the app-private
-    // internal files dir.
-    #[cfg(target_os = "android")]
-    let base = bevy::winit::ANDROID_APP
-        .get()
-        .and_then(|app| app.internal_data_path());
-    #[cfg(not(any(
-        target_os = "macos",
-        target_os = "linux",
-        target_os = "windows",
-        target_os = "ios",
-        target_os = "android"
-    )))]
+    // The browser has no filesystem: the path only names the localStorage key.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     let base: Option<PathBuf> = None;
 
     base

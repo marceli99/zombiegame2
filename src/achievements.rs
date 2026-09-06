@@ -88,21 +88,13 @@ impl AchievementId {
 // ── Persistence ───────────────────────────────────────────────────
 
 fn save_dir() -> PathBuf {
-    // Desktop keeps the historical `$HOME/.zombiegame2` location so existing
-    // progress is preserved; phones route through the shared per-platform
-    // data dir (their HOME/cwd fallbacks are unset or unwritable).
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    let dir = {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".zombiegame2")
-    };
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    let dir = crate::settings::data_dir()
-        .map(|b| b.join("zombiegame2"))
-        .unwrap_or_else(|| PathBuf::from("."));
-    dir
+    // Native keeps the historical `$HOME/.zombiegame2` location so existing
+    // progress is preserved; in the browser the path only names the
+    // localStorage key (see `storage.rs`).
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".zombiegame2")
 }
 
 #[derive(Resource, Default, Serialize, Deserialize)]

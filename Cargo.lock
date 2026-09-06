@@ -461,7 +461,6 @@ dependencies = [
  "bevy_reflect",
  "bevy_transform",
  "bevy_utils",
- "cpal",
  "rodio",
 ]
 
