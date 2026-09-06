@@ -64,6 +64,17 @@ fi
 rm -rf web/assets
 cp -r assets web/assets
 
+# Precompressed sidecars: the signaling server (tower-http `ServeDir`) hands
+# out `.br` / `.gz` next to the original when the browser accepts them, so a
+# self-hosted deploy ships ~3.5 MB instead of the raw ~21 MB.  GitHub Pages
+# compresses on its own and ignores these.
+for f in web/pkg/*.wasm web/pkg/*.js; do
+    gzip -9 -f -k "$f"
+    if command -v brotli >/dev/null; then
+        brotli -q 11 -f -k "$f"
+    fi
+done
+
 echo
 echo "web/pkg/zombiegame2_bg.wasm: $(du -h "$WASM" | cut -f1) (gzip: $(gzip -9 -c "$WASM" | wc -c | numfmt --to=iec))"
 

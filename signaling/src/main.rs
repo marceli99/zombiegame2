@@ -264,11 +264,12 @@ async fn main() {
     // Plain static serving — `/` gets index.html, anything missing is a
     // 404.  No SPA-style index fallback: bevy_asset probes `<asset>.meta`
     // files and treats a 200 with HTML as a corrupt meta file, which silently
-    // kills the font.
+    // kills the font.  `.br` / `.gz` sidecars (written by build-web.sh) are
+    // served in place of the 21 MB .wasm when the browser accepts them.
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .with_state(Shared::default())
-        .fallback_service(ServeDir::new(&web));
+        .fallback_service(ServeDir::new(&web).precompressed_br().precompressed_gzip());
 
     eprintln!("signaling on http://{listen}/  (serving {})", web.display());
     let listener = tokio::net::TcpListener::bind(listen).await.expect("bind");

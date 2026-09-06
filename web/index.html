@@ -106,7 +106,9 @@
   }
 
   // Stream the .wasm with a progress bar, then hand the buffered response to
-  // wasm-bindgen's init.
+  // wasm-bindgen's init.  `content-length` is the *compressed* size when the
+  // server gzips/brotlis the file while the stream yields decoded bytes, so
+  // the ratio is only a hint — clamp it.
   async function download(url) {
     const res = await fetch(url);
     const total = +res.headers.get('content-length') || 0;
@@ -116,7 +118,7 @@
       const { done, value } = await reader.read();
       if (done) break;
       chunks.push(value); got += value.length;
-      if (total) $('fill').style.width = (100 * got / total).toFixed(1) + '%';
+      if (total) $('fill').style.width = Math.min(100, 100 * got / total).toFixed(1) + '%';
       $('status').textContent = `pobieranie… ${(got / 1048576).toFixed(1)} MB`;
     }
     $('fill').style.width = '100%';
