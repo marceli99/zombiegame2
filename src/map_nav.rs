@@ -192,3 +192,113 @@ fn snap_to_walkable(walkable: &[bool], col: i32, row: i32) -> (i32, i32) {
     }
     (col, row)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn all_walkable() -> Vec<bool> {
+        vec![true; (MAP_COLS * MAP_ROWS) as usize]
+    }
+
+    /// Blocks the (2·half+1)² tile patch centred on (col, row), clipped to
+    /// the map bounds.
+    fn block_patch(walkable: &mut [bool], col: i32, row: i32, half: i32) {
+        for r in (row - half)..=(row + half) {
+            for c in (col - half)..=(col + half) {
+                if in_bounds(c, r) {
+                    walkable[nav_idx(c, r)] = false;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn snap_is_identity_on_walkable_tile() {
+        let walkable = all_walkable();
+        assert_eq!(snap_to_walkable(&walkable, 120, 24), (120, 24));
+        assert_eq!(snap_to_walkable(&walkable, 0, 0), (0, 0));
+    }
+
+    #[test]
+    fn snap_finds_nearest_ring_outside_blocked_patch() {
+        let mut walkable = all_walkable();
+        block_patch(&mut walkable, 120, 24, 1); // rings 0-1 blocked
+        let (c, r) = snap_to_walkable(&walkable, 120, 24);
+        // First walkable ring is Chebyshev distance 2 from the start.
+        assert_eq!((c - 120).abs().max((r - 24).abs()), 2);
+        assert!(walkable[nav_idx(c, r)]);
+    }
+
+    /// BFS from a blocked start (player standing on/inside a wall tile)
+    /// must still produce a usable field anchored at the snapped tile —
+    /// this is what keeps zombies pathing instead of freezing.
+    #[test]
+    fn bfs_from_blocked_start_yields_field_anchored_nearby() {
+        let mut walkable = all_walkable();
+        block_patch(&mut walkable, 120, 24, 1); // 3×3 wall around the start
+        let dist = bfs_distance_field_bounded(&walkable, tile_center(120, 24), 20);
+
+        // Blocked tiles stay unreachable.
+        assert_eq!(dist[nav_idx(120, 24)], u16::MAX);
+        assert_eq!(dist[nav_idx(121, 25)], u16::MAX);
+        // The field is finite just outside the patch.
+        assert_ne!(dist[nav_idx(123, 24)], u16::MAX);
+        // Exactly one anchor tile (dist 0), walkable, within snap range
+        // (Chebyshev 2) of the nominal start.
+        let mut zeros = 0;
+        for r in 0..MAP_ROWS {
+            for c in 0..MAP_COLS {
+                if dist[nav_idx(c, r)] == 0 {
+                    zeros += 1;
+                    assert!(walkable[nav_idx(c, r)]);
+                    assert_eq!((c - 120).abs().max((r - 24).abs()), 2);
+                }
+            }
+        }
+        assert_eq!(zeros, 1, "expected exactly one BFS anchor");
+        // Monotone descent: every finite tile with d > 0 has a strictly
+        // closer 8-neighbour — the property zombie steering relies on.
+        let dirs: [(i32, i32); 8] = [
+            (-1, 0), (1, 0), (0, -1), (0, 1),
+            (-1, -1), (-1, 1), (1, -1), (1, 1),
+        ];
+        for r in 0..MAP_ROWS {
+            for c in 0..MAP_COLS {
+                let d = dist[nav_idx(c, r)];
+                if d == u16::MAX || d == 0 {
+                    continue;
+                }
+                let downhill = dirs.iter().any(|&(dc, dr)| {
+                    in_bounds(c + dc, r + dr) && dist[nav_idx(c + dc, r + dr)] < d
+                });
+                assert!(downhill, "tile ({c},{r}) at d={d} has no downhill neighbour");
+            }
+        }
+    }
+
+    /// A start sealed beyond the 8-ring snap search gives up cleanly:
+    /// all-MAX field, no panic, no out-of-bounds indexing.
+    #[test]
+    fn bfs_gives_up_when_no_walkable_tile_within_snap_range() {
+        let mut walkable = all_walkable();
+        block_patch(&mut walkable, 120, 24, 10); // 21×21 ≫ ring 8
+        let dist = bfs_distance_field_bounded(&walkable, tile_center(120, 24), 20);
+        assert!(dist.iter().all(|&d| d == u16::MAX));
+    }
+
+    /// Blocked start at the map corner: the ring scan probes negative
+    /// cols/rows (guarded only by `in_bounds`) and must neither panic nor
+    /// index out of bounds, then anchor on an in-map ring-1 neighbour.
+    #[test]
+    fn snap_probes_out_of_bounds_corners_safely() {
+        let mut walkable = all_walkable();
+        walkable[nav_idx(0, 0)] = false;
+        let dist = bfs_distance_field_bounded(&walkable, tile_center(0, 0), 20);
+        assert_eq!(dist[nav_idx(0, 0)], u16::MAX);
+        let anchored = [(1, 0), (0, 1), (1, 1)]
+            .iter()
+            .any(|&(c, r)| dist[nav_idx(c, r)] == 0);
+        assert!(anchored, "no ring-1 anchor next to the blocked corner");
+    }
+}

@@ -5,3 +5,8 @@ ios/build/
 ios/DerivedData/
 ios/*.xcodeproj/
 .DS_Store
+
+# Browser build outputs (see build-web.sh); web/index.html is checked in.
+web/pkg/
+web/assets/
+__pycache__/

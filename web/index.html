@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Zombies - Waves of Survival</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #050508; overflow: hidden;
+               font-family: monospace; color: #ddd; }
+  #wrap { position: fixed; inset: 0; }
+  /* winit sizes the canvas to its parent (`fit_canvas_to_parent`). */
+  #game { display: block; width: 100%; height: 100%; outline: none;
+          touch-action: none; }
+  #overlay { position: fixed; inset: 0; display: flex; flex-direction: column;
+             align-items: center; justify-content: center; gap: 18px;
+             background: #050508; z-index: 10; user-select: none; }
+  #overlay h1 { font-size: clamp(20px, 5vw, 44px); letter-spacing: 3px;
+                color: #c8ff3a; margin: 0; }
+  #bar { width: min(70vw, 420px); height: 10px; border: 2px solid #555; }
+  #fill { height: 100%; width: 0; background: #c8ff3a; transition: width .15s; }
+  #status { font-size: 14px; color: #999; min-height: 1.2em; }
+  /* Debug console mirror — visible with `?debug` (used by headless tests). */
+  #log { display: none; position: fixed; left: 0; bottom: 0; max-height: 40%;
+         width: 100%; overflow: auto; margin: 0; padding: 4px; font-size: 11px;
+         background: rgba(0,0,0,.75); color: #f66; z-index: 20;
+         white-space: pre-wrap; pointer-events: none; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" tabindex="0"></canvas></div>
+<div id="overlay">
+  <h1>ZOMBIES</h1>
+  <div id="bar"><div id="fill"></div></div>
+  <div id="status">pobieranie…</div>
+</div>
+<pre id="log"></pre>
+<script type="module">
+  import init from './pkg/zombiegame2.js';
+
+  const params = new URLSearchParams(location.search);
+  const $ = id => document.getElementById(id);
+  // Where the game brokers WebRTC connections.  Default: the `/ws` endpoint
+  // of whatever served this page (the signaling server also serves `web/`);
+  // override with `?signaling=wss://host/ws` when the page is hosted
+  // statically somewhere else (e.g. GitHub Pages).
+  window.ZG_SIGNALING = params.get('signaling') ||
+    (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+  // Invite links: `?room=K7X2` drops the player straight into the join
+  // screen with the code filled in.  When *this* page hosts a room, the
+  // engine calls `zgRoomCreated` and we put the code in the address bar so
+  // the host can share the URL as-is.
+  window.ZG_ROOM = (params.get('room') || '').toUpperCase();
+  window.zgRoomCreated = code => {
+    const u = new URL(location.href);
+    u.searchParams.set('room', code);
+    history.replaceState(null, '', u);
+  };
+  // Developer toggles (`?low_gfx`, `?no_msaa`, `?force_touch`) — read by
+  // `dev_flag()` in src/lib.rs; the native build uses `ZG_*` env vars.
+  window.ZG_FLAGS = [...params.keys()].join(',');
+
+  const log = $('log');
+  if (params.has('debug')) log.style.display = 'block';
+  // Mirror errors/warnings into the page so a screenshot shows them.
+  const mirror = (tag, args) => {
+    log.textContent += `[${tag}] ` + args.map(String).join(' ') + '\n';
+  };
+  for (const level of ['error', 'warn']) {
+    const orig = console[level].bind(console);
+    console[level] = (...a) => { orig(...a); mirror(level, a); };
+  }
+  window.addEventListener('error', e => mirror('uncaught', [e.message]));
+  window.addEventListener('unhandledrejection', e => mirror('rejection', [e.reason]));
+
+  // The engine starts as soon as the .wasm is in — no "click to play" gate.
+  // Browsers create an AudioContext made before any user gesture in the
+  // suspended state and never resume it on their own, so we intercept every
+  // context the audio backend creates and resume them all on the first
+  // gesture (a key press or click in the menu counts).  Phones also get
+  // fullscreen + landscape on that first touch, which needs a gesture too.
+  const contexts = [];
+  for (const name of ['AudioContext', 'webkitAudioContext']) {
+    const Orig = window[name];
+    if (!Orig) continue;
+    const Wrapped = function (...args) {
+      const ctx = new Orig(...args);
+      contexts.push(ctx);
+      return ctx;
+    };
+    Wrapped.prototype = Orig.prototype;
+    window[name] = Wrapped;
+  }
+  const coarse = matchMedia('(pointer: coarse)').matches;
+  const unlock = async () => {
+    for (const ctx of contexts) {
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    }
+    if (coarse && !document.fullscreenElement) {
+      // Both may be refused (iOS Safari has no fullscreen API) — harmless.
+      try { await document.documentElement.requestFullscreen(); } catch {}
+      try { await screen.orientation.lock('landscape'); } catch {}
+    }
+  };
+  for (const ev of ['pointerdown', 'keydown', 'touchend']) {
+    window.addEventListener(ev, unlock, { capture: true, passive: true });
+  }
+
+  // Stream the .wasm with a progress bar, then hand the buffered response to
+  // wasm-bindgen's init.
+  async function download(url) {
+    const res = await fetch(url);
+    const total = +res.headers.get('content-length') || 0;
+    const reader = res.body.getReader();
+    const chunks = []; let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value); got += value.length;
+      if (total) $('fill').style.width = (100 * got / total).toFixed(1) + '%';
+      $('status').textContent = `pobieranie… ${(got / 1048576).toFixed(1)} MB`;
+    }
+    $('fill').style.width = '100%';
+    return new Response(new Blob(chunks), {
+      headers: { 'Content-Type': 'application/wasm' },
+    });
+  }
+
+  (async () => {
+    try {
+      const wasm = await download('./pkg/zombiegame2_bg.wasm');
+      $('status').textContent = 'uruchamianie…';
+      try {
+        await init({ module_or_path: wasm });
+      } catch (e) {
+        // winit hands control to the browser event loop by throwing a
+        // sentinel exception out of `App::run()` — the engine is running.
+        if (!String(e).includes('Using exceptions for control flow')) throw e;
+      }
+      $('overlay').style.display = 'none';
+      $('game').focus();
+    } catch (e) {
+      $('status').textContent = 'błąd: ' + e;
+      console.error(e);
+    }
+  })();
+</script>
+</body>
+</html>

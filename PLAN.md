@@ -1,5 +1,9 @@
 # Plan poprawek — zombiegame2
 
+> **ARCHIWUM (2026-08-27):** plan zrealizowany w całości (ETAP 1–6 ✅) i
+> zamknięty. Dokument zachowany wyłącznie jako historyczny zapis — nie jest to
+> aktualna roadmapa projektu.
+
 > Utworzony: 2026-05-07
 > Źródło: pełen audyt kodu (combat / net / map / UI / code quality) + weryfikacja własna.
 
@@ -195,7 +199,7 @@ Cel: posprzątać po pivocie mapy + zmniejszyć `map.rs`. Wykonany jako jeden du
 - [x] Skasowane: `ELEVATOR_HALF`, `ELEVATORS`, `ShopKind`, `ShopSpec`, `DoorSide`, `MarkerKind`, `ElevatorSpec`, `SHOPS`, `SHOP_WALL_THICK`, `SHOP_DOOR_WIDTH`, `shop_back_room_pos`, `shop_wall_rects` z `map.rs`.
 - [x] Skasowany cały `src/elevator.rs` (pusty plugin) + wpis `mod elevator` i `ElevatorPlugin` z `main.rs`.
 - [x] **Zachowane**: `src/zones.rs` (`ZoneState` używany przez `achievements.rs::Explorer` i `zombie.rs`).
-- [x] **Zachowane**: `src/underground.rs` (rzeczywiście używany — `manhole_teleport_system` na metro mapie).
+- [x] **Skasowany (2026-09-06)**: `src/underground.rs` (metro / manhole / teleport) razem z hookami: clamp kamery w `lib.rs`, `UNDERGROUND_EXTENT_Y`/`world_min_y` w `map_obstacles.rs` i `bullet.rs`, dwustrefowy `clamp_player_y` w `player.rs`, podziemny spawn w `zombie.rs`.
 
 ### 6c. Split `map.rs` — pominięty ⚠️
 

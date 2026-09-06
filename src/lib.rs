@@ -10,23 +10,27 @@ mod map_obstacles;
 mod menu;
 mod mobile;
 mod net;
+#[cfg(target_arch = "wasm32")]
+mod net_web;
 mod pause;
 mod pixelart;
 mod player;
 mod settings;
+mod storage;
 mod sync;
 mod ui;
-mod underground;
 mod wave;
 mod weapon;
 mod world_consts;
 mod zombie;
-mod zones;
 
 use bevy::prelude::*;
 use bevy::render::camera::ScalingMode;
+use bevy::render::render_resource::Shader;
 use bevy::time::Fixed;
-use bevy::window::{PrimaryWindow, WindowMode, WindowResizeConstraints};
+use bevy::window::PrimaryWindow;
+#[cfg(not(target_arch = "wasm32"))]
+use bevy::window::{WindowMode, WindowResizeConstraints};
 
 use crate::map::{MAP_HEIGHT, MAP_WIDTH};
 use crate::net::{NetContext, NetMode};
@@ -48,8 +52,44 @@ pub const TICK_HZ: f64 = 60.0;
 /// iOS) or the `ZG_FORCE_TOUCH` desktop preview.  Mirrors the condition that
 /// lights up the on-screen touch controls so the zoom and the controls always
 /// turn on together.
+/// Developer switch, off by default: on native an environment variable
+/// `ZG_<NAME>` (e.g. `ZG_LOW_GFX=1`), in the browser a `?<name>` query
+/// parameter (`?low_gfx`, exported by `web/index.html` as `window.ZG_FLAGS`).
+/// Lets the same preview/diagnostic toggles work on both platforms.
+pub fn dev_flag(name: &str) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|w| js_sys::Reflect::get(&w, &"ZG_FLAGS".into()).ok())
+            .and_then(|v| v.as_string())
+            .map(|s| s.split(',').any(|f| f.eq_ignore_ascii_case(name)))
+            .unwrap_or(false)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::env::var(format!("ZG_{}", name.to_ascii_uppercase())).is_ok()
+    }
+}
+
 pub fn mobile_profile() -> bool {
-    cfg!(any(target_os = "android", target_os = "ios")) || std::env::var("ZG_FORCE_TOUCH").is_ok()
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Browser: probe once whether the primary pointer is a finger
+        // (`pointer: coarse` — phones/tablets, but not a touch-screen laptop
+        // driven by a mouse).  Cached because `view_height()` asks every frame.
+        static COARSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *COARSE.get_or_init(|| {
+            dev_flag("force_touch")
+                || web_sys::window()
+                    .and_then(|w| w.match_media("(pointer: coarse)").ok().flatten())
+                    .map(|mq| mq.matches())
+                    .unwrap_or(false)
+        })
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        cfg!(any(target_os = "android", target_os = "ios")) || dev_flag("force_touch")
+    }
 }
 
 /// Effective vertical view height for the 2D camera — the single source of
@@ -85,6 +125,9 @@ pub enum PauseState {
 #[derive(Resource)]
 pub struct UiAssets {
     pub font: Handle<Font>,
+    /// Radial darkening stretched over every menu screen (see
+    /// `menu::build_vignette_image`).
+    pub vignette: Handle<Image>,
 }
 
 #[derive(Resource, Default)]
@@ -115,42 +158,52 @@ pub fn gameplay_active(
 /// Builds and runs the game.  Called by the desktop binary (`src/main.rs`) and
 /// by the Android entry point (`#[bevy_main]`, below).
 pub fn run() {
+    // Route Rust panics to the browser console with a readable stack trace
+    // instead of an opaque "unreachable executed".
+    #[cfg(target_arch = "wasm32")]
+    console_error_panic_hook::set_once();
+
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
             .set(WindowPlugin {
-                primary_window: Some(Window {
-                    title: "Zombies - Waves of Survival".into(),
-                    resolution: (WINDOW_WIDTH, WINDOW_HEIGHT).into(),
-                    mode: WindowMode::BorderlessFullscreen,
-                    resizable: true,
-                    resize_constraints: WindowResizeConstraints {
-                        min_width: WINDOW_WIDTH,
-                        min_height: WINDOW_HEIGHT,
-                        ..default()
-                    },
-                    ..default()
-                }),
+                primary_window: Some(primary_window()),
                 ..default()
             })
             .set(ImagePlugin::default_nearest()),
     );
 
+    override_ui_shader(&mut app);
+
     let font: Handle<Font> = app
         .world()
         .resource::<AssetServer>()
         .load("fonts/PressStart2P.ttf");
-    app.insert_resource(UiAssets { font });
+    let vignette = app
+        .world_mut()
+        .resource_mut::<Assets<Image>>()
+        .add(menu::build_vignette_image());
+    app.insert_resource(UiAssets { font, vignette });
 
     // MSAA crashes some Android GPUs/drivers; disable it there.  (Bevy's own
-    // mobile example does the same.)  Desktop/iOS keep the default 4× MSAA.
-    #[cfg(target_os = "android")]
-    app.insert_resource(Msaa::Off);
+    // mobile example does the same.)  Phone browsers sit on the same GPUs.
+    // Desktop/iOS keep the default 4× MSAA; `ZG_NO_MSAA` / `?no_msaa`
+    // previews the no-MSAA look anywhere.
+    if cfg!(target_os = "android")
+        || (cfg!(target_arch = "wasm32") && mobile_profile())
+        || dev_flag("no_msaa")
+    {
+        app.insert_resource(Msaa::Off);
+    }
 
     app.init_state::<GameState>()
         .init_state::<PauseState>()
         .insert_resource(ClearColor(Color::srgb(0.02, 0.02, 0.03)))
         .insert_resource(Time::<Fixed>::from_hz(TICK_HZ))
+        // After a hitch (background tab, GC pause) run at most ~6 catch-up
+        // ticks instead of Bevy's default 15 — a hosting browser would
+        // otherwise burst 15 snapshots in one frame.
+        .insert_resource(Time::<Virtual>::from_max_delta(std::time::Duration::from_millis(100)))
         .init_resource::<Score>()
         .init_resource::<CameraShake>()
         .add_plugins((
@@ -168,15 +221,14 @@ pub fn run() {
             bullet::BulletPlugin,
             weapon::WeaponPlugin,
             wave::WavePlugin,
-            zones::ZonesPlugin,
             achievements::AchievementsPlugin,
             audio::AudioFxPlugin,
             ui::UiPlugin,
             chat::ChatPlugin,
-            underground::UndergroundPlugin,
             mobile::MobileControlsPlugin,
         ))
         .add_systems(Startup, setup_camera)
+        .add_systems(Update, export_debug_state.run_if(|| dev_flag("debug")))
         .add_systems(
             Update,
             // Camera reads Transform after `interpolate_logical_pos` has
@@ -188,6 +240,97 @@ pub fn run() {
                 .run_if(in_state(GameState::Playing)),
         )
         .run();
+}
+
+/// Test hook (`?debug` / `ZG_DEBUG`): publish the local player id and every
+/// player's position so the headless multiplayer tests can assert on game
+/// state instead of guessing from screenshots.  Browser: `window.zgState`
+/// (JSON); native: no-op.
+fn export_debug_state(
+    ctx: Res<NetContext>,
+    state: Res<State<GameState>>,
+    nav: Res<crate::map_nav::NavGrid>,
+    players: Query<(&Player, &Transform)>,
+    zombies: Query<(&crate::zombie::Zombie, &Transform)>,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let mut json = format!(
+            "{{\"my_id\":{},\"state\":\"{:?}\",\"flows\":{:?},\"players\":[",
+            ctx.my_id,
+            state.get(),
+            nav.player_flow.keys().collect::<Vec<_>>()
+        );
+        for (i, (p, t)) in players.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(
+                "{{\"id\":{},\"x\":{:.1},\"y\":{:.1},\"hp\":{}}}",
+                p.id, t.translation.x, t.translation.y, p.hp
+            ));
+        }
+        json.push_str("],\"zombies\":[");
+        for (i, (z, t)) in zombies.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&format!(
+                "{{\"x\":{:.0},\"y\":{:.0},\"hp\":{}}}",
+                t.translation.x, t.translation.y, z.hp
+            ));
+        }
+        json.push_str("]}");
+        if let Some(win) = web_sys::window() {
+            let _ = js_sys::Reflect::set(&win, &"zgState".into(), &json.into());
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (&ctx, &state, &nav, &players, &zombies);
+}
+
+/// Swap bevy_ui's built-in shader for the corrected copy in
+/// `src/shaders/ui.wgsl` (see the header there): 0.14's `antialias()` has
+/// its `clamp` arguments in the wrong order, which is harmless on Vulkan but
+/// makes every bordered UI node render as a solid block of its border colour
+/// on WebGL2.  Replacing the asset behind `UI_SHADER_HANDLE` before the
+/// pipeline is first compiled is enough — no fork of bevy_ui needed.
+fn override_ui_shader(app: &mut App) {
+    app.world_mut().resource_mut::<Assets<Shader>>().insert(
+        bevy::ui::UI_SHADER_HANDLE.id(),
+        Shader::from_wgsl(include_str!("shaders/ui.wgsl"), "zombiegame2/src/shaders/ui.wgsl"),
+    );
+}
+
+/// Primary window config.  Desktop opens borderless fullscreen at the design
+/// resolution; the browser build instead binds to the `#game` canvas in
+/// `web/index.html` and lets the page size it (fullscreen there needs a user
+/// gesture, which the page's start overlay provides).
+fn primary_window() -> Window {
+    #[cfg(target_arch = "wasm32")]
+    {
+        Window {
+            title: "Zombies - Waves of Survival".into(),
+            canvas: Some("#game".into()),
+            fit_canvas_to_parent: true,
+            ..default()
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        Window {
+            title: "Zombies - Waves of Survival".into(),
+            resolution: (WINDOW_WIDTH, WINDOW_HEIGHT).into(),
+            mode: WindowMode::BorderlessFullscreen,
+            resizable: true,
+            resize_constraints: WindowResizeConstraints {
+                min_width: WINDOW_WIDTH,
+                min_height: WINDOW_HEIGHT,
+                ..default()
+            },
+            ..default()
+        }
+    }
 }
 
 fn setup_camera(mut commands: Commands) {
@@ -203,8 +346,11 @@ fn setup_camera(mut commands: Commands) {
     // Using a runtime `cfg!()` flag (not `#[cfg]`) keeps BOTH paths compiled on
     // every target, so the desktop build type-checks the mobile path too — and
     // `ZG_LOW_GFX=1` lets you preview the lean look on desktop.
+    // Phone browsers get the lean profile too; a desktop browser keeps the
+    // full look (WebGL2 handles HDR + bloom fine).
     let lean_gfx = cfg!(any(target_os = "android", target_os = "ios"))
-        || std::env::var("ZG_LOW_GFX").is_ok();
+        || (cfg!(target_arch = "wasm32") && mobile_profile())
+        || dev_flag("low_gfx");
 
     if lean_gfx {
         camera.camera.hdr = false;
@@ -271,40 +417,12 @@ fn camera_follow(
     let half_view_w = view_w * 0.5;
     let half_view_h = view_h / 2.0;
 
-    // Camera clamp is context-dependent: while the player is on the
-    // surface we clamp to the surface map rect; once they descend below
-    // the surface south boundary we switch to the underground rect so
-    // neither the void above the metro nor the empty space east/west of
-    // its bounding box ever enters frame.
-    let (min_x, max_x, min_y, max_y) = if target.y < -crate::map::MAP_HEIGHT * 0.5 {
-        // Underground bounds (metro platform + tracks).
-        let lo_x = crate::underground::UNDER_LEFT + half_view_w;
-        let hi_x = crate::underground::UNDER_RIGHT - half_view_w;
-        let lo_y = crate::underground::UNDER_BOTTOM + half_view_h;
-        let hi_y = crate::underground::UNDER_TOP - half_view_h;
-        // If the metro is narrower than the viewport, lock the camera to
-        // its centre instead of producing an inverted clamp range.
-        let (mn_x, mx_x) = if hi_x >= lo_x {
-            (lo_x, hi_x)
-        } else {
-            let cx = crate::underground::UNDER_CX;
-            (cx, cx)
-        };
-        let (mn_y, mx_y) = if hi_y >= lo_y {
-            (lo_y, hi_y)
-        } else {
-            let cy = crate::underground::UNDER_CY;
-            (cy, cy)
-        };
-        (mn_x, mx_x, mn_y, mx_y)
-    } else {
-        let surf_x = (MAP_WIDTH / 2.0 - half_view_w).max(0.0);
-        let surf_y = (MAP_HEIGHT / 2.0 - half_view_h).max(0.0);
-        (-surf_x, surf_x, -surf_y, surf_y)
-    };
+    // Clamp the camera to the map rect so nothing outside it enters frame.
+    let max_x = (MAP_WIDTH / 2.0 - half_view_w).max(0.0);
+    let max_y = (MAP_HEIGHT / 2.0 - half_view_h).max(0.0);
 
-    let base_x = target.x.clamp(min_x, max_x);
-    let base_y = target.y.clamp(min_y, max_y);
+    let base_x = target.x.clamp(-max_x, max_x);
+    let base_y = target.y.clamp(-max_y, max_y);
 
     // Apply screen shake — random offset proportional to intensity.  Decay
     // exponentially so big hits punch hard and fade smoothly.

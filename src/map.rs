@@ -1253,6 +1253,9 @@ impl Plugin for MapPlugin {
                 FixedUpdate,
                 clear_interact_flag
                     .after(InteractConsumers)
+                    // On a net client the packet send is also a consumer — an
+                    // interact press must ship before the flag is wiped.
+                    .after(crate::sync::client_send_input)
                     .run_if(gameplay_active),
             );
     }
@@ -1274,10 +1277,10 @@ fn animate_segment_fog(
     time: Res<Time>,
     mut q: Query<(&SegmentFog, &mut Sprite, &mut Transform)>,
 ) {
-    let t = time.elapsed_seconds();
+    let t = time.elapsed_seconds_wrapped();
     // Keep the fog opaque on mobile (see spawn_segment_fog_and_gates) so it
     // stays a single non-blended layer; desktop breathes its alpha.
-    let lean = cfg!(any(target_os = "android", target_os = "ios"));
+    let lean = crate::mobile_profile();
     for (fog, mut sprite, mut transform) in &mut q {
         let phase = fog.idx as f32 * 1.37;
         let breathe = if lean {
@@ -1313,7 +1316,7 @@ fn animate_window_glow(
     inside: Res<LocalInsideBuilding>,
     mut q: Query<(&WindowGlow, &BuildingRoof, &mut Sprite)>,
 ) {
-    let t = time.elapsed_seconds();
+    let t = time.elapsed_seconds_wrapped();
     for (glow, roof, mut sprite) in &mut q {
         // Player is inside this building — the exterior shell is hidden, so
         // its facade windows must not glow on top of the revealed interior.
@@ -1425,7 +1428,7 @@ fn animate_lamp_flicker(
     time: Res<Time>,
     mut q: Query<(&LampFlicker, &mut Sprite)>,
 ) {
-    let t = time.elapsed_seconds();
+    let t = time.elapsed_seconds_wrapped();
     for (flicker, mut sprite) in &mut q {
         let slow = (t * 1.6 + flicker.phase).sin() * 0.5 + 0.5; // 0..1
         // "Glitch" — a higher-frequency component sometimes drops harder.
@@ -1444,7 +1447,7 @@ fn pulse_gate_barriers(
     time: Res<Time>,
     mut q: Query<(&GateBarrier, &mut Sprite)>,
 ) {
-    let t = time.elapsed_seconds();
+    let t = time.elapsed_seconds_wrapped();
     for (gate, mut sprite) in &mut q {
         let phase = gate.from_seg as f32 * 0.9;
         // Sine in [0, 1] for the warm highlight ramp.
@@ -2033,7 +2036,7 @@ fn spawn_map(
     // pre-blended quad — two full-viewport alpha blends per frame are a top
     // fill-rate cost on tiled, bandwidth-bound mobile GPUs.  Desktop keeps the
     // exact two-layer look (overdraw is free on a dGPU).
-    if cfg!(any(target_os = "android", target_os = "ios")) {
+    if crate::mobile_profile() {
         let atmo_tex = images.add(build_overcast_composite_image());
         commands.spawn(SpriteBundle {
             texture: atmo_tex,
@@ -2185,7 +2188,7 @@ fn spawn_segment_fog_and_gates(
         // a third full-screen blend layer.  On mobile render it opaque (it
         // already reads as a near-solid grey wall at 0.78) so a tiled GPU skips
         // that blend; desktop keeps the translucent look.
-        let fog_alpha = if cfg!(any(target_os = "android", target_os = "ios")) {
+        let fog_alpha = if crate::mobile_profile() {
             1.0
         } else {
             0.78
@@ -2701,11 +2704,19 @@ fn toggle_roof_walls(
     // become non-collision (so the player can walk off the edge).  Walls
     // of every other multi-floor building are restored to their original
     // shape.
+    let mut restored = false;
     for (b_idx, walls) in indices.walls.iter() {
         let kind = BUILDINGS[*b_idx].kind;
         let active = state.building == Some(*b_idx) && state.floor == top_floor(kind);
         for (obs_idx, original) in walls {
             if let Some(o) = obstacles.list.get_mut(*obs_idx) {
+                // Restoring a zeroed wall needs a grid rebuild: the
+                // OnEnter(Playing) rebuilds drop Circle(0) entries from the
+                // cells, so an in-place shape write alone can leave the wall
+                // unbinned (collision silently gone from session 2 onward).
+                if !active && matches!(o.shape, ObstacleShape::Circle(r) if r <= 0.0) {
+                    restored = true;
+                }
                 o.shape = if active {
                     ObstacleShape::Circle(0.0)
                 } else {
@@ -2713,6 +2724,11 @@ fn toggle_roof_walls(
                 };
             }
         }
+    }
+    // Zeroing transitions don't need this (grid queries short-circuit on
+    // Circle(0)); only fires on a floor transition, and rebuild is cheap.
+    if restored {
+        obstacles.rebuild_grid();
     }
 }
 
@@ -2729,6 +2745,7 @@ fn toggle_floor_obstacles(
     if !state.is_changed() {
         return;
     }
+    let mut restored = false;
     for ((b_idx, floor), items) in indices.by.iter() {
         let active = if *floor == 0 {
             // Ground-floor furniture stays solid as long as the player
@@ -2739,6 +2756,13 @@ fn toggle_floor_obstacles(
         };
         for (obs_idx, original) in items {
             if let Some(o) = obstacles.list.get_mut(*obs_idx) {
+                // Same re-bin rule as `toggle_roof_walls`: a restore out of
+                // the zeroed state must rebuild the grid, because the
+                // OnEnter(Playing) rebuilds drop Circle(0) entries and the
+                // in-place write alone would leave the obstacle unbinned.
+                if active && matches!(o.shape, ObstacleShape::Circle(r) if r <= 0.0) {
+                    restored = true;
+                }
                 o.shape = if active {
                     *original
                 } else {
@@ -2747,11 +2771,18 @@ fn toggle_floor_obstacles(
             }
         }
     }
+    if restored {
+        obstacles.rebuild_grid();
+    }
 }
 
 fn check_roof_fall(
     mut state: ResMut<PlayerFloorState>,
-    mut players: Query<(&mut Transform, &Player)>,
+    mut players: Query<(
+        &mut Transform,
+        &Player,
+        Option<&mut crate::player::LogicalPos>,
+    )>,
     mut dmg: EventWriter<crate::player::PlayerDamagedEvent>,
     ctx: Res<NetContext>,
 ) {
@@ -2772,7 +2803,7 @@ fn check_roof_fall(
     // centre is one tile past the wall outer face — far enough that the
     // visual reads as "I just stepped off", not flickering at the doorway.
     let leave_margin = -TILE_SIZE * 0.6;
-    for (mut t, p) in players.iter_mut() {
+    for (mut t, p, lp) in players.iter_mut() {
         if p.id != ctx.my_id {
             continue;
         }
@@ -2788,6 +2819,14 @@ fn check_roof_fall(
             let stair = staircase_world_pos(b);
             t.translation.x = stair.x;
             t.translation.y = stair.y;
+            // Sync logical pos so the FixedUpdate restore/interp cycle
+            // doesn't clobber this Update-time teleport (it rewrites
+            // Transform from LogicalPos every frame) or lerp the player
+            // from the roof edge to the staircase.
+            if let Some(mut lp) = lp {
+                lp.curr = t.translation.truncate();
+                lp.prev = lp.curr;
+            }
             state.floor = 0;
         }
         break;

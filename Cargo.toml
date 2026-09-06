@@ -1,3 +1,9 @@
+# `signaling/` is the tiny WebSocket server that brokers WebRTC connections
+# between browsers (and serves `web/`).  It shares this lock file but is built
+# separately (`cargo run -p signaling`); the game's own targets never link it.
+[workspace]
+members = ["signaling"]
+
 [package]
 name = "zombiegame2"
 version = "0.1.0"
@@ -82,8 +88,10 @@ assets = "assets"
 # regenerate them from icon-src.svg with `tools/gen-icon.sh`.
 resources = "res"
 # arm64 = real phones; x86_64 = the Android emulator on a PC.  Building both
-# makes one universal APK that installs on either.  Drop x86_64 for a leaner
-# release once you no longer need emulator testing.
+# makes one universal APK that installs on either — but the x86_64 .so roughly
+# doubles the APK, and no real device uses it.  For a shipped release, drop
+# "x86_64-linux-android" from this list before running ./build-android.sh;
+# emulator testing is the only reason to keep it.
 build_targets = ["aarch64-linux-android", "x86_64-linux-android"]
 
 [package.metadata.android.sdk]
@@ -112,3 +120,46 @@ name = "android.permission.INTERNET"
 [package.metadata.android.signing.release]
 path = "release.keystore"
 keystore_password = "zombiegame"
+
+# ── Web (wasm32-unknown-unknown) ───────────────────────────────────────────
+# Browser build.  `webgl2` picks the wgpu GL backend (WebGPU would need a
+# separate build and narrower browser support).  The `getrandom`/`uuid` lines
+# exist only to flip their JS-randomness features on — `rand`, `ahash` and
+# `bevy_asset` pull these crates in transitively and fail to compile for wasm
+# without them.  `web-sys` features are the browser APIs the game touches
+# directly (localStorage for settings/achievements, `matchMedia` for the
+# touch-profile probe; WebRTC bindings are added by the net layer).
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy = { version = "0.14", default-features = false, features = ["webgl2"] }
+getrandom = { version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+uuid = { version = "1", features = ["js"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Location",
+    "Storage",
+    "MediaQueryList",
+    # Signaling (net_web.rs)
+    "WebSocket",
+    "MessageEvent",
+    "CloseEvent",
+    "BinaryType",
+    # WebRTC data channels (net_web.rs)
+    "RtcPeerConnection",
+    "RtcConfiguration",
+    "RtcIceServer",
+    "RtcDataChannel",
+    "RtcDataChannelInit",
+    "RtcDataChannelType",
+    "RtcDataChannelEvent",
+    "RtcPeerConnectionIceEvent",
+    "RtcPeerConnectionState",
+    "RtcIceCandidate",
+    "RtcIceCandidateInit",
+    "RtcSessionDescriptionInit",
+    "RtcSdpType",
+] }

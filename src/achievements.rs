@@ -4,13 +4,19 @@ use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 
 use crate::audio::SfxEvent;
+use crate::map::MapSegmentUnlockState;
+use crate::net::is_authoritative;
 use crate::player::PlayerDamagedEvent;
 use crate::wave::WaveState;
 use crate::zombie::{ZombieKilledEvent, ZombieKind};
-use crate::zones::ZoneState;
 use crate::{GameState, UiAssets};
 
 const TOAST_DURATION: f32 = 3.5;
+
+/// One bit per `Weapon::as_u8` value, excluding bit 0 (the starting Pistol):
+/// FullArsenal requires collecting every other weapon kind in a single game.
+const FULL_ARSENAL_MASK: u32 =
+    ((1u32 << crate::weapon::WEAPON_COUNT as u32) - 1) & !1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AchievementId {
@@ -71,8 +77,8 @@ impl AchievementId {
             Self::WaveSurvivor10 => "Reach wave 10",
             Self::WaveSurvivor20 => "Reach wave 20",
             Self::Untouchable => "Complete a wave without taking damage",
-            Self::FullArsenal => "Buy every weapon from shops",
-            Self::Explorer => "Unlock all zones",
+            Self::FullArsenal => "Collect every weapon type in one game",
+            Self::Explorer => "Unlock all map segments",
             Self::Demolition => "Kill 20 zombies with explosions in one game",
             Self::Speedrunner => "Reach wave 5 in under 3 minutes",
         }
@@ -109,7 +115,7 @@ impl AchievementSave {
     pub fn load() -> Self {
         let mut path = save_dir();
         path.push("save.json");
-        let raw = match std::fs::read_to_string(&path) {
+        let raw = match crate::storage::read_to_string(&path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Self::default();
@@ -132,13 +138,21 @@ impl AchievementSave {
                 // next save.
                 let mut bak = path.clone();
                 bak.set_extension("json.bak");
-                let _ = std::fs::write(&bak, &raw);
-                warn!(
-                    "Achievements save at {} is corrupted ({}). Backed up to {}, starting from defaults.",
-                    path.display(),
-                    e,
-                    bak.display()
-                );
+                match crate::storage::write(&bak, &raw) {
+                    Ok(()) => warn!(
+                        "Achievements save at {} is corrupted ({}). Backed up to {}, starting from defaults.",
+                        path.display(),
+                        e,
+                        bak.display()
+                    ),
+                    Err(be) => warn!(
+                        "Achievements save at {} is corrupted ({}); backup to {} failed ({}). Starting from defaults.",
+                        path.display(),
+                        e,
+                        bak.display(),
+                        be
+                    ),
+                }
                 Self::default()
             }
         }
@@ -146,13 +160,13 @@ impl AchievementSave {
 
     pub fn save(&self) {
         let dir = save_dir();
-        if let Err(e) = std::fs::create_dir_all(&dir) {
+        if let Err(e) = crate::storage::create_dir_all(&dir) {
             warn!("Failed to create save dir {}: {}", dir.display(), e);
         }
         let mut path = dir;
         path.push("save.json");
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            if let Err(e) = std::fs::write(&path, json) {
+            if let Err(e) = crate::storage::write(&path, &json) {
                 warn!("Failed to save achievements to {}: {}", path.display(), e);
             }
         }
@@ -167,7 +181,9 @@ pub struct AchievementTracker {
     pub explosion_kills: u32,
     pub exploder_kill_times: VecDeque<f64>,
     pub kill_times: VecDeque<f64>,
-    pub weapons_bought: u8,
+    /// Bitmask (`1 << Weapon::as_u8`) of weapon kinds the local player has
+    /// picked up this game — written by `pickup_collection` in weapon.rs.
+    pub weapons_held: u32,
     pub took_damage_this_wave: bool,
     pub prev_in_break: bool,
     pub pending_toasts: VecDeque<AchievementId>,
@@ -180,7 +196,7 @@ impl Default for AchievementTracker {
             explosion_kills: 0,
             exploder_kill_times: VecDeque::new(),
             kill_times: VecDeque::new(),
-            weapons_bought: 0,
+            weapons_held: 0,
             took_damage_this_wave: false,
             prev_in_break: true,
             pending_toasts: VecDeque::new(),
@@ -227,6 +243,18 @@ impl Plugin for AchievementsPlugin {
                 (track_kills, track_damage, check_achievements)
                     .chain()
                     .after(tick_gameplay_clock)
+                    .run_if(in_state(GameState::Playing))
+                    // Kill/damage events only fire on the authoritative peer
+                    // (host/SP); running these on an MP client would keep
+                    // `game_kills` at 0 yet falsely unlock Untouchable off
+                    // the replicated `WaveState` break edge.
+                    .run_if(is_authoritative),
+            )
+            .add_systems(
+                Update,
+                check_progress_achievements
+                    .after(tick_gameplay_clock)
+                    .after(check_achievements)
                     .run_if(in_state(GameState::Playing)),
             )
             .add_systems(Update, update_toasts)
@@ -316,11 +344,13 @@ fn try_unlock(
     true
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Achievements fed by host-only facts: `ZombieKilledEvent`,
+/// `PlayerDamagedEvent` and the pickup tracker only exist on the
+/// authoritative peer (host/SP), so this system is gated on
+/// `is_authoritative` — an MP client checking these would false-unlock
+/// off its never-written trackers.
 fn check_achievements(
-    clock: Res<GameplayClock>,
     wave: Res<WaveState>,
-    zone_state: Res<ZoneState>,
     mut tracker: ResMut<AchievementTracker>,
     mut save: ResMut<AchievementSave>,
     mut sfx: EventWriter<SfxEvent>,
@@ -357,18 +387,6 @@ fn check_achievements(
         any_new = true;
     }
 
-    if wave.current_wave >= 10
-        && try_unlock(AchievementId::WaveSurvivor10, &mut save, &mut tracker)
-    {
-        any_new = true;
-    }
-
-    if wave.current_wave >= 20
-        && try_unlock(AchievementId::WaveSurvivor20, &mut save, &mut tracker)
-    {
-        any_new = true;
-    }
-
     // Untouchable: wave just ended without taking damage
     if wave.in_break
         && !tracker.prev_in_break
@@ -384,21 +402,58 @@ fn check_achievements(
     }
     tracker.prev_in_break = wave.in_break;
 
-    // FullArsenal: all 7 shop weapons purchased (bits 1-7)
-    if tracker.weapons_bought & 0b1111_1110 == 0b1111_1110
+    // FullArsenal: every weapon kind (minus the starting Pistol) collected
+    if tracker.weapons_held & FULL_ARSENAL_MASK == FULL_ARSENAL_MASK
         && try_unlock(AchievementId::FullArsenal, &mut save, &mut tracker)
-    {
-        any_new = true;
-    }
-
-    if zone_state.unlocked.iter().all(|&u| u)
-        && try_unlock(AchievementId::Explorer, &mut save, &mut tracker)
     {
         any_new = true;
     }
 
     if tracker.explosion_kills >= 20
         && try_unlock(AchievementId::Demolition, &mut save, &mut tracker)
+    {
+        any_new = true;
+    }
+
+    if any_new {
+        // One batched write per unlock frame as crash insurance (the durable
+        // flush is `save_on_exit`) — several unlocks in the same frame used
+        // to cost one full-file write each.
+        save.save();
+        sfx.send(SfxEvent::MenuSelect);
+    }
+}
+
+/// Achievements driven purely by replicated world progress (`WaveState`,
+/// `MapSegmentUnlockState`) plus the local gameplay clock — safe to check
+/// on every peer, so MP clients can still earn them.
+#[allow(clippy::too_many_arguments)]
+fn check_progress_achievements(
+    clock: Res<GameplayClock>,
+    wave: Res<WaveState>,
+    segments: Res<MapSegmentUnlockState>,
+    mut tracker: ResMut<AchievementTracker>,
+    mut save: ResMut<AchievementSave>,
+    mut sfx: EventWriter<SfxEvent>,
+) {
+    let mut any_new = false;
+
+    if wave.current_wave >= 10
+        && try_unlock(AchievementId::WaveSurvivor10, &mut save, &mut tracker)
+    {
+        any_new = true;
+    }
+
+    if wave.current_wave >= 20
+        && try_unlock(AchievementId::WaveSurvivor20, &mut save, &mut tracker)
+    {
+        any_new = true;
+    }
+
+    // Explorer: every map segment opened — reads the live segment-gate
+    // state, not the legacy `ZoneState` stub (which defaults to all-open).
+    if segments.unlocked.iter().all(|&u| u)
+        && try_unlock(AchievementId::Explorer, &mut save, &mut tracker)
     {
         any_new = true;
     }
@@ -411,9 +466,7 @@ fn check_achievements(
     }
 
     if any_new {
-        // One batched write per unlock frame as crash insurance (the durable
-        // flush is `save_on_exit`) — several unlocks in the same frame used
-        // to cost one full-file write each.
+        // Same batched-save policy as `check_achievements` above.
         save.save();
         sfx.send(SfxEvent::MenuSelect);
     }

@@ -1,7 +1,12 @@
 use bevy::prelude::*;
 
+use crate::menu::{
+    panel_bundle, spawn_background, spawn_divider, spawn_title_block, MenuError, BG_COLOR,
+    TEXT_DIM, TEXT_HIGHLIGHT, TEXT_NORMAL, TEXT_SUBTITLE,
+};
 use crate::net::{
-    broadcast, ClientInEvent, NetContext, NetMode, PlayerNicknames, ServerEvent, ServerMsg,
+    broadcast, ClientInEvent, NetContext, NetMode, PlayerNicknames, send_to, ServerEvent,
+    ServerMsg,
 };
 use crate::{GameState, UiAssets};
 
@@ -13,6 +18,10 @@ pub struct LobbyPlayerList;
 
 #[derive(Component)]
 pub struct LobbyStatusText;
+
+/// "ROOM CODE: XXXX" — what the host reads out to friends.
+#[derive(Component)]
+pub struct LobbyRoomText;
 
 /// Pre-start countdown shared by host and client.  Host owns the
 /// authoritative timer; client mirrors it from broadcast events purely
@@ -37,6 +46,14 @@ pub struct LobbyToast {
 
 const LOBBY_TOAST_DURATION: f32 = 2.5;
 
+/// Previous frame's roster baseline for `track_lobby_changes`.  A Resource
+/// rather than a `Local` so `OnExit(GameState::Lobby)` can clear it — a
+/// `Local` survives leaving the lobby, and the next session's first frame
+/// would diff the fresh roster against the stale one, flashing a bogus
+/// JOIN/LEFT toast.
+#[derive(Resource, Default)]
+struct PrevLobbyPlayers(Option<Vec<u8>>);
+
 #[derive(Component)]
 pub struct LobbyToastText;
 
@@ -46,10 +63,11 @@ impl Plugin for LobbyPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<LobbyCountdown>()
             .init_resource::<LobbyToast>()
+            .init_resource::<PrevLobbyPlayers>()
             .add_systems(OnEnter(GameState::Lobby), spawn_lobby)
             .add_systems(
                 OnExit(GameState::Lobby),
-                (despawn_lobby, reset_countdown, reset_toast),
+                (despawn_lobby, reset_countdown, reset_toast, reset_roster_diff),
             )
             .add_systems(
                 Update,
@@ -76,6 +94,10 @@ fn reset_toast(mut toast: ResMut<LobbyToast>) {
     *toast = LobbyToast::default();
 }
 
+fn reset_roster_diff(mut prev_players: ResMut<PrevLobbyPlayers>) {
+    prev_players.0 = None;
+}
+
 /// Diff `lobby_players` against the previous frame and surface a brief
 /// on-screen toast for any join / leave.  Runs on both host and client —
 /// each side sees the same delta because the host syncs the list to all
@@ -84,13 +106,17 @@ fn track_lobby_changes(
     ctx: Res<NetContext>,
     nicknames: Res<PlayerNicknames>,
     mut toast: ResMut<LobbyToast>,
-    mut prev_players: Local<Option<Vec<u8>>>,
+    mut prev_players: ResMut<PrevLobbyPlayers>,
 ) {
     let current = ctx.lobby_players.clone();
-    let Some(prev) = prev_players.as_ref() else {
-        // First observation — record but don't toast (would fire on lobby
-        // entry for ourselves).
-        *prev_players = Some(current);
+    let Some(prev) = prev_players.0.as_ref() else {
+        // First observation this session — record but don't toast (would
+        // fire on lobby entry for ourselves).  An empty list is a client
+        // still waiting for its first LobbyState; keep waiting so the real
+        // roster becomes the baseline instead of toasting the whole lobby.
+        if !current.is_empty() {
+            prev_players.0 = Some(current);
+        }
         return;
     };
     let joined: Vec<u8> = current.iter().copied().filter(|id| !prev.contains(id)).collect();
@@ -112,7 +138,7 @@ fn track_lobby_changes(
         toast.text = format!("{name} LEFT");
         toast.remaining = LOBBY_TOAST_DURATION;
     }
-    *prev_players = Some(current);
+    prev_players.0 = Some(current);
 }
 
 fn tick_lobby_toast(time: Res<Time>, mut toast: ResMut<LobbyToast>) {
@@ -125,6 +151,8 @@ fn tick_lobby_toast(time: Res<Time>, mut toast: ResMut<LobbyToast>) {
     }
 }
 
+/// Same framed panel as the main menu, so the flow menu → lobby → game
+/// doesn't jump between two visual languages.
 fn spawn_lobby(mut commands: Commands, assets: Res<UiAssets>, net: Res<NetMode>) {
     let font = assets.font.clone();
     commands
@@ -135,88 +163,104 @@ fn spawn_lobby(mut commands: Commands, assets: Res<UiAssets>, net: Res<NetMode>)
                     height: Val::Percent(100.0),
                     justify_content: JustifyContent::Center,
                     align_items: AlignItems::Center,
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(18.0),
                     ..default()
                 },
-                background_color: BackgroundColor(Color::srgb(0.05, 0.06, 0.08)),
+                background_color: BackgroundColor(BG_COLOR),
                 ..default()
             },
             LobbyRoot,
         ))
-        .with_children(|parent| {
-            let title = match *net {
-                NetMode::Host => "LOBBY - HOST",
-                NetMode::Client => "LOBBY - CLIENT",
-                _ => "LOBBY",
-            };
-            parent.spawn(TextBundle::from_section(
-                title,
-                TextStyle {
-                    font: font.clone(),
-                    font_size: 48.0,
-                    color: Color::srgb(0.85, 0.15, 0.15),
-                },
-            ));
-            parent.spawn((
-                TextBundle::from_section(
-                    "PLAYERS: 1/4",
-                    TextStyle {
-                        font: font.clone(),
-                        font_size: 22.0,
-                        color: Color::srgb(0.9, 0.9, 0.9),
+        .with_children(|root| {
+            spawn_background(root, &assets);
+            root.spawn(panel_bundle()).with_children(|panel| {
+                spawn_title_block(panel, &font, "LOBBY");
+                panel.spawn(TextBundle::from_section(
+                    match *net {
+                        NetMode::Host => "YOU ARE HOSTING",
+                        NetMode::Client => "JOINED A ROOM",
+                        _ => "",
                     },
-                )
-                .with_style(Style {
-                    margin: UiRect::top(Val::Px(20.0)),
-                    ..default()
-                }),
-                LobbyPlayerList,
-            ));
-            parent.spawn((
-                TextBundle::from_section(
-                    "",
                     TextStyle {
                         font: font.clone(),
                         font_size: 16.0,
-                        color: Color::srgb(1.0, 0.82, 0.2),
+                        color: TEXT_SUBTITLE,
                     },
-                )
-                .with_style(Style {
-                    margin: UiRect::top(Val::Px(26.0)),
-                    ..default()
-                }),
-                LobbyStatusText,
-            ));
-            parent.spawn((
-                TextBundle::from_section(
-                    "",
-                    TextStyle {
-                        font: font.clone(),
-                        font_size: 14.0,
-                        color: Color::srgba(0.6, 0.95, 0.6, 0.0),
+                ));
+                spawn_divider(panel);
+                panel.spawn((
+                    TextBundle::from_section(
+                        "",
+                        TextStyle {
+                            font: font.clone(),
+                            font_size: 24.0,
+                            color: TEXT_HIGHLIGHT,
+                        },
+                    )
+                    .with_style(Style {
+                        min_height: Val::Px(30.0),
+                        ..default()
+                    }),
+                    LobbyRoomText,
+                ));
+                panel.spawn((
+                    TextBundle::from_section(
+                        "PLAYERS: 1/4",
+                        TextStyle {
+                            font: font.clone(),
+                            font_size: 16.0,
+                            color: TEXT_NORMAL,
+                        },
+                    )
+                    .with_style(Style {
+                        margin: UiRect::top(Val::Px(12.0)),
+                        ..default()
+                    }),
+                    LobbyPlayerList,
+                ));
+                panel.spawn((
+                    TextBundle::from_section(
+                        "",
+                        TextStyle {
+                            font: font.clone(),
+                            font_size: 16.0,
+                            color: TEXT_HIGHLIGHT,
+                        },
+                    )
+                    .with_style(Style {
+                        margin: UiRect::top(Val::Px(18.0)),
+                        min_height: Val::Px(18.0),
+                        ..default()
+                    }),
+                    LobbyStatusText,
+                ));
+                panel.spawn((
+                    TextBundle::from_section(
+                        "",
+                        TextStyle {
+                            font: font.clone(),
+                            font_size: 16.0,
+                            color: Color::srgba(0.6, 0.95, 0.6, 0.0),
+                        },
+                    )
+                    .with_style(Style {
+                        min_height: Val::Px(16.0),
+                        ..default()
+                    }),
+                    LobbyToastText,
+                ));
+                spawn_divider(panel);
+                panel.spawn(TextBundle::from_section(
+                    match *net {
+                        NetMode::Host => "ENTER - START   ESC - BACK",
+                        _ => "ESC - LEAVE ROOM",
                     },
-                )
-                .with_style(Style {
-                    margin: UiRect::top(Val::Px(10.0)),
-                    ..default()
-                }),
-                LobbyToastText,
-            ));
-            parent.spawn(
-                TextBundle::from_section(
-                    "ESC - back to menu",
                     TextStyle {
                         font,
-                        font_size: 11.0,
-                        color: Color::srgb(0.5, 0.5, 0.5),
+                        font_size: 16.0,
+                        color: TEXT_DIM,
                     },
-                )
-                .with_style(Style {
-                    margin: UiRect::top(Val::Px(60.0)),
-                    ..default()
-                }),
-            );
+                ));
+            });
         });
 }
 
@@ -226,10 +270,14 @@ fn despawn_lobby(mut commands: Commands, q: Query<Entity, With<LobbyRoot>>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn poll_host_lobby_events(
     mut ctx: ResMut<NetContext>,
-    net: Res<NetMode>,
+    mut net: ResMut<NetMode>,
     mut nicknames: ResMut<PlayerNicknames>,
+    countdown: Res<LobbyCountdown>,
+    mut next_state: ResMut<NextState<GameState>>,
+    mut menu_error: ResMut<MenuError>,
 ) {
     if *net != NetMode::Host {
         return;
@@ -255,6 +303,20 @@ fn poll_host_lobby_events(
                 let players = ctx.lobby_players.clone();
                 if let Some(host) = ctx.host.as_ref() {
                     broadcast(host, &ServerMsg::LobbyState { players });
+                    // A joiner arriving mid-countdown missed the original
+                    // CountdownStart broadcast — without this they'd sit on
+                    // "WAITING FOR HOST..." and snap straight into gameplay
+                    // when Started lands.  Targeted send so existing clients'
+                    // already-ticking mirrors stay untouched.
+                    if let Some(remaining) = countdown.remaining {
+                        send_to(
+                            host,
+                            id,
+                            &ServerMsg::CountdownStart {
+                                seconds: remaining.ceil() as u8,
+                            },
+                        );
+                    }
                 }
             }
             ServerEvent::Disconnected { id } => {
@@ -268,6 +330,17 @@ fn poll_host_lobby_events(
             ServerEvent::Hello { id, nickname } => {
                 nicknames.0.insert(id, nickname);
             }
+            ServerEvent::RoomCode { code } => {
+                ctx.room_code = code;
+            }
+            ServerEvent::HostError { reason } => {
+                // No room to host in — back to the menu with the reason.
+                menu_error.0 = reason;
+                ctx.disconnect();
+                *net = NetMode::SinglePlayer;
+                next_state.set(GameState::Menu);
+                return;
+            }
             ServerEvent::Input { .. } | ServerEvent::ChatRelay { .. } => {}
         }
     }
@@ -278,6 +351,7 @@ fn poll_client_lobby_events(
     mut next_state: ResMut<NextState<GameState>>,
     mut mode: ResMut<NetMode>,
     mut countdown: ResMut<LobbyCountdown>,
+    mut menu_error: ResMut<MenuError>,
 ) {
     if *mode != NetMode::Client {
         return;
@@ -289,7 +363,14 @@ fn poll_client_lobby_events(
     let mut new_events = Vec::new();
     if let Ok(rx) = events_arc.lock() {
         while let Ok(e) = rx.try_recv() {
+            // Stop at `Started`: whatever follows (the first snapshots, whose
+            // delta fields carry the full pickup/nickname state) belongs to
+            // the in-game receiver, not the lobby's bit bucket.
+            let started = matches!(e, ClientInEvent::Started);
             new_events.push(e);
+            if started {
+                break;
+            }
         }
     }
     for e in new_events {
@@ -311,6 +392,12 @@ fn poll_client_lobby_events(
                 countdown.remaining = None;
             }
             ClientInEvent::Snapshot(_) | ClientInEvent::Chat { .. } => {}
+            ClientInEvent::ConnectFailed { reason } => {
+                menu_error.0 = reason;
+                ctx.disconnect();
+                *mode = NetMode::SinglePlayer;
+                next_state.set(GameState::Menu);
+            }
             ClientInEvent::Disconnected
             | ClientInEvent::FullLobby
             | ClientInEvent::GameInProgress
@@ -318,6 +405,12 @@ fn poll_client_lobby_events(
                 // Disconnect, full lobby, mid-game rejection, or protocol
                 // mismatch all funnel back to the menu — the lobby can't
                 // recover from any of them.
+                menu_error.0 = match e {
+                    ClientInEvent::FullLobby => "ROOM FULL".into(),
+                    ClientInEvent::GameInProgress => "GAME ALREADY RUNNING".into(),
+                    ClientInEvent::ProtocolMismatch { .. } => "VERSION MISMATCH".into(),
+                    _ => "DISCONNECTED".into(),
+                };
                 ctx.disconnect();
                 *mode = NetMode::SinglePlayer;
                 next_state.set(GameState::Menu);
@@ -430,7 +523,26 @@ fn update_lobby_ui(
             Without<LobbyStatusText>,
         ),
     >,
+    mut room_text: Query<
+        &mut Text,
+        (
+            With<LobbyRoomText>,
+            Without<LobbyPlayerList>,
+            Without<LobbyStatusText>,
+            Without<LobbyToastText>,
+        ),
+    >,
 ) {
+    if let Ok(mut text) = room_text.get_single_mut() {
+        text.sections[0].value = if ctx.room_code.is_empty() {
+            match *net {
+                NetMode::Host => "CREATING ROOM...".to_string(),
+                _ => String::new(),
+            }
+        } else {
+            format!("ROOM CODE: {}", ctx.room_code)
+        };
+    }
     if let Ok(mut text) = list.get_single_mut() {
         let count = ctx.lobby_players.len();
         text.sections[0].value = format!("PLAYERS: {count}/4");
@@ -447,7 +559,10 @@ fn update_lobby_ui(
             }
         } else {
             match *net {
-                NetMode::Host => "ENTER - start game".to_string(),
+                NetMode::Host if ctx.lobby_players.len() < 2 => "WAITING FOR PLAYERS...".to_string(),
+                NetMode::Host => "READY - PRESS ENTER TO START".to_string(),
+                // No roster yet means the WebRTC handshake is still running.
+                NetMode::Client if ctx.lobby_players.is_empty() => "CONNECTING...".to_string(),
                 NetMode::Client => "WAITING FOR HOST...".to_string(),
                 _ => String::new(),
             }

@@ -2,6 +2,7 @@ use bevy::prelude::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+use crate::achievements::AchievementTracker;
 use crate::audio::SfxEvent;
 use crate::map::{is_walkable_tile, tile_center, MapObstacles, MAP_COLS, MAP_ROWS};
 use crate::net::{is_authoritative, NetContext, NetEntities, NetId};
@@ -538,7 +539,9 @@ fn animate_weapon_pickups(
     time: Res<Time>,
     mut q: Query<(Entity, &mut Transform, &mut Sprite), With<WeaponPickup>>,
 ) {
-    let t = time.elapsed_seconds();
+    // Wrapped variant: plain `elapsed_seconds()` loses sub-frame precision
+    // after hours of uptime, turning these phases visibly steppy.
+    let t = time.elapsed_seconds_wrapped();
     for (entity, mut transform, mut sprite) in &mut q {
         let phase = (entity.index() as f32) * 0.37;
         transform.rotation = Quat::from_rotation_z(t * 0.7 + phase);
@@ -854,6 +857,7 @@ fn despawn_all_pickups(
     net_entities.pickups.clear();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pickup_collection(
     mut commands: Commands,
     pickups: Query<(Entity, &Transform, &WeaponPickup, &NetId)>,
@@ -863,6 +867,7 @@ fn pickup_collection(
     mut local: ResMut<crate::net::LocalInput>,
     remote: Res<crate::net::RemoteInputs>,
     ctx: Res<crate::net::NetContext>,
+    mut tracker: ResMut<AchievementTracker>,
 ) {
     for (p_t, mut player) in &mut players {
         if player.hp <= 0 {
@@ -894,6 +899,13 @@ fn pickup_collection(
                 if player.slots[1].is_some() && !want_swap {
                     continue;
                 }
+                // Claim the pickup by removing its net-id first: the
+                // despawn below is deferred, so a second player overlapping
+                // the same pickup this tick still sees the entity — the
+                // failed remove tells us it was already collected.
+                if net_entities.pickups.remove(&net_id.0).is_none() {
+                    continue;
+                }
                 player.slots[1] = Some(pickup.kind);
                 player.ammo[1] = pickup.kind.magazine_size();
                 player.reserve_ammo[1] = pickup.kind.reserve_ammo();
@@ -905,8 +917,10 @@ fn pickup_collection(
                 player.active_slot = 1;
                 if player.id == ctx.my_id {
                     local.0.interact = false;
+                    // FullArsenal progress — only weapons the local player
+                    // picked up themselves count toward the achievement.
+                    tracker.weapons_held |= 1u32 << pickup.kind.as_u8();
                 }
-                net_entities.pickups.remove(&net_id.0);
                 commands.entity(entity).despawn_recursive();
                 sfx.send(SfxEvent::Hit);
                 break;
@@ -963,8 +977,12 @@ fn health_collection(
             let r = PLAYER_RADIUS + PICKUP_PICK_RADIUS;
             let d2 = pp.distance_squared(pk_t.translation.truncate());
             if d2 < r * r {
+                // Skip pickups another player already claimed this tick —
+                // the deferred despawn hasn't applied yet.
+                if net_entities.pickups.remove(&net_id.0).is_none() {
+                    continue;
+                }
                 player.hp = (player.hp + HEAL_AMOUNT).min(PLAYER_MAX_HP);
-                net_entities.pickups.remove(&net_id.0);
                 commands.entity(entity).despawn_recursive();
                 sfx.send(SfxEvent::Heal);
                 break;
@@ -1051,13 +1069,16 @@ fn throwable_collection(
             let r = PLAYER_RADIUS + PICKUP_PICK_RADIUS;
             let d2 = pp.distance_squared(pk_t.translation.truncate());
             if d2 < r * r {
+                // Skip pickups another player already claimed this tick.
+                if net_entities.pickups.remove(&net_id.0).is_none() {
+                    continue;
+                }
                 if player.throwable_kind == pickup.kind {
                     player.throwable_count += pickup.count;
                 } else {
                     player.throwable_kind = pickup.kind;
                     player.throwable_count = pickup.count;
                 }
-                net_entities.pickups.remove(&net_id.0);
                 commands.entity(entity).despawn_recursive();
                 sfx.send(SfxEvent::Hit);
                 break;
@@ -1139,11 +1160,14 @@ fn armor_collection(
             let r = PLAYER_RADIUS + PICKUP_PICK_RADIUS;
             let d2 = pp.distance_squared(pk_t.translation.truncate());
             if d2 < r * r {
+                // Skip pickups another player already claimed this tick.
+                if net_entities.pickups.remove(&net_id.0).is_none() {
+                    continue;
+                }
                 // Armor pickups refill the pool to full — picking one up
                 // effectively doubles your HP, so the bar should snap to
                 // max rather than incrementing in tiny steps.
                 player.armor = PLAYER_ARMOR_MAX;
-                net_entities.pickups.remove(&net_id.0);
                 commands.entity(entity).despawn_recursive();
                 sfx.send(SfxEvent::Hit);
                 break;
@@ -1227,12 +1251,15 @@ fn money_collection(
             let r = PLAYER_RADIUS + PICKUP_PICK_RADIUS;
             let d2 = pp.distance_squared(pk_t.translation.truncate());
             if d2 < r * r {
+                // Skip pickups another player already claimed this tick.
+                if net_entities.pickups.remove(&net_id.0).is_none() {
+                    continue;
+                }
                 // Player-friendly: a weaker pickup never downgrades an active stronger
                 // buff, but it still refreshes the timer so the strong buff lasts
                 // longer. Natural expiry resets `money_mult` to 1 in `player.rs`.
                 player.money_mult = pickup.factor.max(player.money_mult);
                 player.money_mult_timer = MONEY_MULT_DURATION;
-                net_entities.pickups.remove(&net_id.0);
                 commands.entity(entity).despawn_recursive();
                 sfx.send(SfxEvent::Hit);
                 break;

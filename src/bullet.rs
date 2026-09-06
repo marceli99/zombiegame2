@@ -100,17 +100,15 @@ pub struct ZombieGrid {
 impl ZombieGrid {
     fn dims() -> (usize, usize) {
         let cols = ((crate::map::MAP_WIDTH / ZOMBIE_GRID_CELL).ceil() as usize) + 1;
-        let height = crate::map::MAP_HEIGHT + crate::map_obstacles::UNDERGROUND_EXTENT_Y;
-        let rows = ((height / ZOMBIE_GRID_CELL).ceil() as usize) + 1;
+        let rows = ((crate::map::MAP_HEIGHT / ZOMBIE_GRID_CELL).ceil() as usize) + 1;
         (cols, rows)
     }
 
     #[inline]
     fn world_to_cell(p: Vec2) -> (i32, i32) {
-        // Same coordinate transform as ObstacleGrid so underground (negative-Y)
-        // zombies land at non-negative cell indices.
+        // Same coordinate transform as ObstacleGrid.
         let cx = ((p.x + crate::map::MAP_WIDTH * 0.5) / ZOMBIE_GRID_CELL).floor() as i32;
-        let cy = ((p.y - crate::map_obstacles::world_min_y()) / ZOMBIE_GRID_CELL).floor() as i32;
+        let cy = ((p.y + crate::map::MAP_HEIGHT * 0.5) / ZOMBIE_GRID_CELL).floor() as i32;
         (cx, cy)
     }
 
@@ -1806,7 +1804,7 @@ fn update_ambient_embers(
     mut q: Query<(Entity, &mut AmbientEmber, &mut Transform, &mut Sprite)>,
 ) {
     let dt = time.delta_seconds();
-    let t = time.elapsed_seconds();
+    let t = time.elapsed_seconds_wrapped();
     for (e, mut em, mut transform, mut sprite) in &mut q {
         em.lifetime -= dt;
         if em.lifetime <= 0.0 {

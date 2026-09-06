@@ -2,6 +2,7 @@ use bevy::prelude::*;
 use bevy::window::{PresentMode, PrimaryWindow, WindowMode};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::{Duration, Instant};
 
 pub const RESOLUTIONS: [(u32, u32); 5] = [
@@ -99,6 +100,18 @@ impl Default for GraphicsSettings {
 }
 
 impl GraphicsSettings {
+    /// Clamp everything read back from disk / localStorage into range.  The
+    /// option lists are indexed directly, so a hand-edited or stale file
+    /// (an index from a longer list in an older build) would otherwise panic
+    /// on the first frame, every launch.
+    pub fn sanitized(mut self) -> Self {
+        self.resolution_idx = self.resolution_idx.min(RESOLUTIONS.len() - 1);
+        self.fps_cap_idx = self.fps_cap_idx.min(FPS_CAPS.len() - 1);
+        self.quality_idx = self.quality_idx.min(QUALITY_LABELS.len() - 1);
+        self.volume = if self.volume.is_finite() { self.volume.clamp(0.0, 1.0) } else { default_volume() };
+        self
+    }
+
     pub fn resolution_label(&self) -> String {
         let (w, h) = RESOLUTIONS[self.resolution_idx];
         format!("{w} x {h}")
@@ -196,8 +209,11 @@ impl Plugin for SettingsPlugin {
             .add_systems(
                 Update,
                 (detect_initial_resolution, apply_graphics_settings, save_settings_on_change),
-            )
-            .add_systems(Last, fps_limiter);
+            );
+        // The browser paces frames with requestAnimationFrame and has neither
+        // `Instant` nor `thread::sleep`, so the limiter is native-only.
+        #[cfg(not(target_arch = "wasm32"))]
+        app.add_systems(Last, fps_limiter);
     }
 }
 
@@ -254,7 +270,7 @@ fn settings_path() -> PathBuf {
 
 fn load_settings() -> Option<GraphicsSettings> {
     let path = settings_path();
-    let data = match std::fs::read_to_string(&path) {
+    let data = match crate::storage::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
@@ -266,18 +282,26 @@ fn load_settings() -> Option<GraphicsSettings> {
             return None;
         }
     };
-    match serde_json::from_str(&data) {
-        Ok(s) => Some(s),
+    match serde_json::from_str::<GraphicsSettings>(&data) {
+        Ok(s) => Some(s.sanitized()),
         Err(e) => {
             let mut bak = path.clone();
             bak.set_extension("json.bak");
-            let _ = std::fs::write(&bak, &data);
-            warn!(
-                "Graphics settings at {} are corrupted ({}). Backed up to {}, using defaults.",
-                path.display(),
-                e,
-                bak.display()
-            );
+            match crate::storage::write(&bak, &data) {
+                Ok(()) => warn!(
+                    "Graphics settings at {} are corrupted ({}). Backed up to {}, using defaults.",
+                    path.display(),
+                    e,
+                    bak.display()
+                ),
+                Err(be) => warn!(
+                    "Graphics settings at {} are corrupted ({}); backup to {} failed ({}). Using defaults.",
+                    path.display(),
+                    e,
+                    bak.display(),
+                    be
+                ),
+            }
             None
         }
     }
@@ -286,12 +310,12 @@ fn load_settings() -> Option<GraphicsSettings> {
 fn save_settings(settings: &GraphicsSettings) {
     let path = settings_path();
     if let Some(parent) = path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Err(e) = crate::storage::create_dir_all(parent) {
             warn!("Failed to create settings dir {}: {}", parent.display(), e);
         }
     }
     if let Ok(data) = serde_json::to_string_pretty(settings) {
-        if let Err(e) = std::fs::write(&path, data) {
+        if let Err(e) = crate::storage::write(&path, &data) {
             warn!("Failed to save settings to {}: {}", path.display(), e);
         }
     }
@@ -351,7 +375,9 @@ fn apply_graphics_settings(
     // On phones the window is OS-managed fullscreen and the only exposed setting
     // is volume, so never poke the window here — a volume change must not try to
     // restyle resolution / window mode / present mode.
-    if crate::mobile_profile() {
+    // Same in the browser: the "window" is a canvas sized by the page and
+    // fullscreen needs a user gesture, so window settings are a no-op there.
+    if crate::mobile_profile() || cfg!(target_arch = "wasm32") {
         return;
     }
     let Ok(mut window) = windows.get_single_mut() else {
@@ -382,6 +408,7 @@ fn apply_graphics_settings(
 ///
 /// Result: stable cap at the requested FPS without the visible stutter that
 /// pure `thread::sleep(target - elapsed)` introduces under VSync coupling.
+#[cfg(not(target_arch = "wasm32"))]
 fn fps_limiter(settings: Res<GraphicsSettings>, mut last: Local<Option<Instant>>) {
     let Some(cap) = FPS_CAPS[settings.fps_cap_idx] else {
         *last = None;
@@ -416,4 +443,71 @@ fn fps_limiter(settings: Res<GraphicsSettings>, mut last: Local<Option<Instant>>
         std::thread::yield_now();
     }
     *last = Some(deadline);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Golden fixture: a settings.json written before the `volume` field
+    /// existed.  Players' on-disk files are never migrated, only
+    /// deserialized — this exact shape must keep loading forever, or
+    /// `load_settings` treats the file as corrupt and resets everything.
+    const PRE_VOLUME_FILE: &str = r#"{
+        "resolution_idx": 2,
+        "window_mode": "Fullscreen",
+        "vsync": false,
+        "fps_cap_idx": 3,
+        "quality_idx": 1,
+        "show_fps": true
+    }"#;
+
+    #[test]
+    fn pre_volume_settings_file_loads_with_default_volume() {
+        let s: GraphicsSettings =
+            serde_json::from_str(PRE_VOLUME_FILE).expect("old settings file must load");
+        assert_eq!(s.volume, 0.8, "missing volume must fall back to default_volume()");
+        // Every present field survives untouched.
+        assert_eq!(s.resolution_idx, 2);
+        assert!(s.window_mode == WindowModeChoice::Fullscreen);
+        assert!(!s.vsync);
+        assert_eq!(s.fps_cap_idx, 3);
+        assert_eq!(s.quality_idx, 1);
+        assert!(s.show_fps);
+    }
+
+    #[test]
+    fn settings_roundtrip_preserves_every_field() {
+        let orig = GraphicsSettings {
+            resolution_idx: 4,
+            window_mode: WindowModeChoice::Windowed,
+            vsync: false,
+            fps_cap_idx: 9,
+            quality_idx: 3,
+            show_fps: true,
+            volume: 0.3,
+        };
+        let json = serde_json::to_string(&orig).unwrap();
+        let back: GraphicsSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.resolution_idx, orig.resolution_idx);
+        assert!(back.window_mode == orig.window_mode);
+        assert_eq!(back.vsync, orig.vsync);
+        assert_eq!(back.fps_cap_idx, orig.fps_cap_idx);
+        assert_eq!(back.quality_idx, orig.quality_idx);
+        assert_eq!(back.show_fps, orig.show_fps);
+        assert_eq!(back.volume, orig.volume);
+    }
+
+    /// Forcing function for the back-compat contract: today every field
+    /// except `volume` is REQUIRED, so an empty object fails.  If you add
+    /// a new field WITHOUT `#[serde(default)]`, PRE_VOLUME_FILE above
+    /// starts failing too — which is exactly what would happen to every
+    /// existing player's settings.json on upgrade (load_settings backs the
+    /// file up and resets all settings).  Give new fields a serde default.
+    #[test]
+    fn missing_required_field_is_treated_as_corruption() {
+        assert!(serde_json::from_str::<GraphicsSettings>("{}").is_err());
+        // volume is currently the only optional field:
+        assert!(serde_json::from_str::<GraphicsSettings>(PRE_VOLUME_FILE).is_ok());
+    }
 }

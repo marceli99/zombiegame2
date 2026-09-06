@@ -1,0 +1,95 @@
+name: Web
+
+# Browser build: compiles the game to wasm, publishes the static site to
+# GitHub Pages, and pushes a ready-to-run image (signaling server + site) to
+# GHCR for self-hosting.  The Pages site alone can't broker rooms — open it
+# with `?signaling=wss://your-host/ws` pointing at a running image, or just
+# play from the image's own URL (it serves the same site).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  packages: write
+
+concurrency:
+  group: web-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BINARYEN_VERSION: "132"
+
+jobs:
+  build:
+    name: Build site + image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: web
+
+      # wasm-bindgen-cli must match the crate version pinned in Cargo.lock
+      # exactly; grab the matching prebuilt binary instead of compiling it.
+      - name: Install wasm-bindgen + wasm-opt
+        run: |
+          set -eu
+          WB="$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')"
+          curl -sSL "https://github.com/rustwasm/wasm-bindgen/releases/download/${WB}/wasm-bindgen-${WB}-x86_64-unknown-linux-musl.tar.gz" \
+            | tar xz --strip-components=1 -C /usr/local/bin "wasm-bindgen-${WB}-x86_64-unknown-linux-musl/wasm-bindgen"
+          curl -sSL "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VERSION}/binaryen-version_${BINARYEN_VERSION}-x86_64-linux.tar.gz" \
+            | tar xz --strip-components=2 -C /usr/local/bin "binaryen-version_${BINARYEN_VERSION}/bin/wasm-opt"
+          wasm-bindgen --version && wasm-opt --version
+
+      - name: Build web
+        run: ./build-web.sh
+
+      - name: Check signaling server
+        run: cargo check --locked -p signaling
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: web
+
+      # build-push-action's `cache-to: type=gha` needs the buildx driver.
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: signaling/Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: |
+            ghcr.io/${{ github.repository }}/signaling:latest
+            ghcr.io/${{ github.repository }}/signaling:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-pages:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

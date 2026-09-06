@@ -12,25 +12,6 @@ use bevy::prelude::*;
 
 use crate::map::{MAP_HEIGHT, MAP_WIDTH};
 
-/// Extra Y range *below* the surface map covered by the spatial grid — the
-/// metro / underground level lives here.  Bumping this is the only knob
-/// needed to host obstacles outside the original map bounds; player and
-/// camera clamps reference the same constant via `world_min_y()`.
-pub const UNDERGROUND_EXTENT_Y: f32 = 3000.0;
-
-/// Lowest Y the obstacle grid (and player clamp) extends to.  Above this
-/// value all obstacle positions are accepted into the grid.
-#[inline]
-pub fn world_min_y() -> f32 {
-    -MAP_HEIGHT * 0.5 - UNDERGROUND_EXTENT_Y
-}
-
-/// Total Y extent covered by the grid — surface map + underground.
-#[inline]
-fn grid_height_px() -> f32 {
-    MAP_HEIGHT + UNDERGROUND_EXTENT_Y
-}
-
 #[derive(Clone, Copy)]
 pub enum ObstacleShape {
     Circle(f32),
@@ -69,17 +50,16 @@ fn obstacle_aabb(o: &Obstacle) -> (Vec2, Vec2) {
 impl ObstacleGrid {
     #[inline]
     fn world_to_cell(p: Vec2) -> (i32, i32) {
-        // Y is offset by the full grid height (surface + underground) so
-        // obstacles below the original map bounds still land at non-negative
-        // cell indices.  X uses the unchanged map-width offset.
+        // Both axes are offset by half the map size so every in-map position
+        // lands at a non-negative cell index.
         let cx = ((p.x + MAP_WIDTH * 0.5) / OBSTACLE_GRID_CELL).floor() as i32;
-        let cy = ((p.y - world_min_y()) / OBSTACLE_GRID_CELL).floor() as i32;
+        let cy = ((p.y + MAP_HEIGHT * 0.5) / OBSTACLE_GRID_CELL).floor() as i32;
         (cx, cy)
     }
 
     fn rebuild(&mut self, list: &[Obstacle]) {
         self.cols = ((MAP_WIDTH / OBSTACLE_GRID_CELL).ceil() as usize) + 1;
-        self.rows = ((grid_height_px() / OBSTACLE_GRID_CELL).ceil() as usize) + 1;
+        self.rows = ((MAP_HEIGHT / OBSTACLE_GRID_CELL).ceil() as usize) + 1;
         let total = self.cols * self.rows;
         self.cells.clear();
         self.cells.resize_with(total, Vec::new);
@@ -270,5 +250,164 @@ impl MapObstacles {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic LCG (Knuth MMIX constants) so the fuzz layout is
+    /// identical on every run and platform — no `rand`, no time seeds.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_f32(&mut self) -> f32 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // Top 24 bits → uniform in [0, 1).
+            (self.0 >> 40) as f32 / (1u64 << 24) as f32
+        }
+        fn range(&mut self, lo: f32, hi: f32) -> f32 {
+            lo + (hi - lo) * self.next_f32()
+        }
+    }
+
+    /// ~50 mixed Circle+Rect obstacles spread over the whole map rect —
+    /// the exact range `world_to_cell` offsets by.
+    fn mixed_obstacle_set() -> Vec<Obstacle> {
+        let mut rng = Lcg(0x5EED_2026);
+        let mut list = Vec::new();
+        for i in 0..50 {
+            let pos = Vec2::new(
+                rng.range(-MAP_WIDTH * 0.5 + 64.0, MAP_WIDTH * 0.5 - 64.0),
+                rng.range(-MAP_HEIGHT * 0.5 + 64.0, MAP_HEIGHT * 0.5 - 64.0),
+            );
+            let shape = if i % 2 == 0 {
+                ObstacleShape::Circle(rng.range(4.0, 40.0))
+            } else {
+                ObstacleShape::Rect(Vec2::new(rng.range(8.0, 80.0), rng.range(8.0, 80.0)))
+            };
+            list.push(Obstacle { pos, shape });
+        }
+        list
+    }
+
+    /// The grid-accelerated `hits` must agree with the brute-force fallback
+    /// (empty grid) for every query — probing a lattice that straddles the
+    /// 128-px cell edges (±1 px around each boundary plus cell centres)
+    /// across the whole map.  A cell-binning off-by-one
+    /// here means players/bullets clip through walls near cell borders, and
+    /// a stale index makes the `get_unchecked` deref UB.
+    #[test]
+    fn grid_and_bruteforce_agree_on_hits() {
+        let list = mixed_obstacle_set();
+        let mut brute = MapObstacles::default();
+        brute.list = list.clone(); // grid never built → fallback scan
+        let mut grid = MapObstacles::default();
+        grid.list = list;
+        grid.rebuild_grid();
+
+        let x0 = -MAP_WIDTH * 0.5;
+        let y0 = -MAP_HEIGHT * 0.5;
+        let cols = (MAP_WIDTH / OBSTACLE_GRID_CELL).ceil() as i32;
+        let rows = (MAP_HEIGHT / OBSTACLE_GRID_CELL).ceil() as i32;
+        let offsets = [-1.0, 0.0, 1.0, OBSTACLE_GRID_CELL * 0.5];
+        let mut hit_count = 0u32;
+        for cx in 0..=cols {
+            for cy in 0..=rows {
+                for &ox in &offsets {
+                    for &oy in &offsets {
+                        let p = Vec2::new(
+                            x0 + cx as f32 * OBSTACLE_GRID_CELL + ox,
+                            y0 + cy as f32 * OBSTACLE_GRID_CELL + oy,
+                        );
+                        for radius in [5.0, 18.0] {
+                            let b = brute.hits(p, radius);
+                            let g = grid.hits(p, radius);
+                            assert_eq!(b, g, "hits mismatch at {p:?} r={radius}");
+                            hit_count += g as u32;
+                        }
+                    }
+                }
+            }
+        }
+        // Sanity: the lattice actually intersected obstacles — an all-false
+        // sweep would make the equivalence vacuous.
+        assert!(hit_count > 0, "fuzz lattice never hit an obstacle");
+    }
+
+    /// `resolve` postcondition for a single obstacle: wherever the entity
+    /// starts (including deep inside), it ends up non-colliding.  Allows
+    /// 0.01 px of float slack against the strict `<` in `hits`.
+    #[test]
+    fn resolve_ends_outside_single_obstacle() {
+        let shapes = [
+            ObstacleShape::Circle(30.0),
+            ObstacleShape::Rect(Vec2::new(50.0, 20.0)),
+        ];
+        for shape in shapes {
+            let mut o = MapObstacles::default();
+            o.list.push(Obstacle { pos: Vec2::new(200.0, -100.0), shape });
+            o.rebuild_grid();
+            let mut rng = Lcg(7);
+            for _ in 0..200 {
+                let mut p = Vec2::new(rng.range(120.0, 280.0), rng.range(-180.0, -20.0));
+                o.resolve(&mut p, 10.0);
+                assert!(!o.hits(p, 10.0 - 0.01), "resolve left {p:?} colliding");
+            }
+        }
+    }
+
+    /// Deep-penetration Rect branch (entity centre strictly inside the
+    /// rect): pushed fully out along the axis with the smallest exit
+    /// distance, on the nearer side.  All arithmetic here is exact in f32
+    /// so the expected positions compare with `==`.
+    #[test]
+    fn rect_deep_penetration_pushes_out_along_nearest_axis() {
+        let mut o = MapObstacles::default();
+        let center = Vec2::new(10.0, -20.0);
+        let half = Vec2::new(100.0, 40.0);
+        o.list.push(Obstacle { pos: center, shape: ObstacleShape::Rect(half) });
+        o.rebuild_grid();
+        let own = 6.0;
+
+        // Exact centre: Y is the shortest extent (40 < 100); the bottom/top
+        // tie breaks to the top branch (`dy_bot < dy_top` is false).
+        let mut p = center;
+        o.resolve(&mut p, own);
+        assert_eq!(p, Vec2::new(center.x, center.y + half.y + own));
+        assert!(!o.hits(p, own - 0.01));
+
+        // Near the left face: exit left (dx_left = 10 beats dy = 40).
+        let mut p = center + Vec2::new(-90.0, 0.0);
+        o.resolve(&mut p, own);
+        assert_eq!(p, Vec2::new(center.x - half.x - own, center.y));
+        assert!(!o.hits(p, own - 0.01));
+
+        // Near the bottom face: exit down (dy_bot = 10 beats dx = 100).
+        let mut p = center + Vec2::new(0.0, -30.0);
+        o.resolve(&mut p, own);
+        assert_eq!(p, Vec2::new(center.x, center.y - half.y - own));
+        assert!(!o.hits(p, own - 0.01));
+    }
+
+    /// Shallow Rect overlap (centre outside the rect, closer than
+    /// own_radius to its surface): pushed straight off the closest face.
+    #[test]
+    fn rect_shallow_overlap_pushes_off_nearest_face() {
+        let mut o = MapObstacles::default();
+        o.list.push(Obstacle {
+            pos: Vec2::new(10.0, -20.0),
+            shape: ObstacleShape::Rect(Vec2::new(100.0, 40.0)),
+        });
+        o.rebuild_grid();
+        // 2 px above the top face, radius 6 → pushed to 6 px above it.
+        let mut p = Vec2::new(10.0, 22.0);
+        o.resolve(&mut p, 6.0);
+        assert_eq!(p, Vec2::new(10.0, 26.0));
+        assert!(!o.hits(p, 5.99));
     }
 }

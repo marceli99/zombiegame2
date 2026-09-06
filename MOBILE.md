@@ -1,5 +1,10 @@
 # Mobile (Android / iOS)
 
+> **Legacy (2026-09):** the game moved to the browser (see README) and the
+> native Android / iOS packaging below is no longer maintained. Phones now play
+> the web build — the touch controls and mobile render profile described here
+> are what it uses, so this document stays as background on those systems.
+
 The game is structured so mobile is a first-class target: the whole game is a
 library (`src/lib.rs`) that builds as a desktop binary, an Android `cdylib`, and
 an iOS `staticlib` from the same code. Touch + gamepad controls and a
@@ -48,6 +53,22 @@ SDK + platform-34 + build-tools + NDK, plus the Rust targets and `cargo-apk`:
 rustup target add aarch64-linux-android x86_64-linux-android
 cargo install cargo-apk
 ```
+
+**One-time: create the signing keystore.** Release APKs are signed with
+`release.keystore` in the repo root, which is git-ignored — on a fresh clone it
+does not exist and `cargo apk build --release` (what `build-android.sh` runs)
+**fails trying to open it**. Generate the throwaway self-signed key once
+(`keytool` ships with the JDK, e.g. `$JAVA_HOME/bin/keytool`):
+
+```sh
+keytool -genkeypair -keystore release.keystore -alias zombie -keyalg RSA \
+  -keysize 2048 -validity 10000 -storepass zombiegame -keypass zombiegame \
+  -dname "CN=Zombiegame, O=Zombiegame, C=PL"
+```
+
+That key is fine for sideloading; for a Google Play upload replace it with a
+properly managed upload key (see the `[package.metadata.android.signing.release]`
+comment in `Cargo.toml`). Never commit a keystore.
 
 Then just:
 

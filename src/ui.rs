@@ -179,7 +179,11 @@ impl Plugin for UiPlugin {
             .init_resource::<WaveIntroState>()
             .init_resource::<ComboState>()
             .init_resource::<BossAlertTimer>()
-            .add_systems(OnEnter(GameState::Playing), (spawn_hud, reset_combo))
+            .init_resource::<HudCache>()
+            // The HUD is respawned blank each round, so the "already shown"
+            // cache must start blank too — otherwise any value equal to the
+            // previous round's stays unrendered until it changes.
+            .add_systems(OnEnter(GameState::Playing), (spawn_hud, reset_combo, reset_hud_cache))
             .add_systems(
                 OnExit(GameState::Playing),
                 (despawn_hud, reset_wave_intro, reset_combo),
@@ -950,7 +954,7 @@ fn despawn_hud(mut commands: Commands, q: Query<Entity, With<HudRoot>>) {
 /// (`format!` builds a fresh `String` every time), so we only re-format
 /// when the underlying value actually changed.  Each field is `Option`
 /// so the first frame of a play session always re-renders.
-#[derive(Default)]
+#[derive(Resource, Default)]
 struct HudCache {
     hp: Option<i32>,
     armor: Option<i32>,
@@ -967,6 +971,10 @@ struct HudCache {
     throwable_count: Option<u32>,
 }
 
+fn reset_hud_cache(mut cache: ResMut<HudCache>) {
+    *cache = HudCache::default();
+}
+
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_hud(
     ctx: Res<NetContext>,
@@ -974,7 +982,7 @@ fn update_hud(
     score: Res<Score>,
     wave: Res<WaveState>,
     zombies: Query<(), With<Zombie>>,
-    mut cache: Local<HudCache>,
+    mut cache: ResMut<HudCache>,
     mut bars: ParamSet<(
         Query<&mut Style, With<HpBarFill>>,
         Query<&mut Style, With<ArmorBarFill>>,
@@ -1330,7 +1338,7 @@ fn update_boss_alert(
         };
         if active {
             // Fast pulse for that classic alarm feel.
-            let pulse = (time.elapsed_seconds() * 7.0).sin() * 0.5 + 0.5;
+            let pulse = (time.elapsed_seconds_wrapped() * 7.0).sin() * 0.5 + 0.5;
             border.0 = Color::srgba(1.0, 0.12, 0.18, 0.5 + pulse * 0.4);
         }
     }
@@ -1338,7 +1346,7 @@ fn update_boss_alert(
         if let Ok(mut text) = text_q.get_single_mut() {
             // Punch the text alpha at the same pulse so the warning reads
             // even if the player is looking away from the centre.
-            let pulse = (time.elapsed_seconds() * 7.0).sin() * 0.5 + 0.5;
+            let pulse = (time.elapsed_seconds_wrapped() * 7.0).sin() * 0.5 + 0.5;
             for sec in &mut text.sections {
                 sec.style.color.set_alpha(0.65 + pulse * 0.35);
             }
@@ -1516,7 +1524,7 @@ fn update_damage_overlay(
         .unwrap_or(PLAYER_MAX_HP);
     let hp_pct = (local_hp.max(0) as f32 / PLAYER_MAX_HP as f32).clamp(0.0, 1.0);
     let low_hp_factor = ((0.30 - hp_pct) / 0.30).max(0.0);
-    let pulse = (time.elapsed_seconds() * 3.0).sin() * 0.5 + 0.5;
+    let pulse = (time.elapsed_seconds_wrapped() * 3.0).sin() * 0.5 + 0.5;
     let low_hp_alpha = low_hp_factor * (0.06 + pulse * 0.10);
 
     let alpha = flash_alpha.max(low_hp_alpha).min(0.34);

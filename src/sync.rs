@@ -80,12 +80,19 @@ impl Plugin for NetSyncPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<SnapshotHistory>()
             .init_resource::<ApplyScratch>()
+            .init_resource::<BroadcastState>()
+            .add_systems(OnEnter(GameState::Playing), reset_broadcast_state.run_if(is_host))
             .add_systems(
                 FixedUpdate,
                 (server_receive_inputs, server_broadcast_snapshot)
                     .run_if(in_state(GameState::Playing))
                     .run_if(is_host),
             )
+            // The per-tick broadcast stops the moment the host leaves
+            // `Playing`, so the snapshot that carries `game_over: true` has to
+            // be sent explicitly on the way into GameOver — otherwise joiners
+            // sit in a frozen round until the host returns to the menu.
+            .add_systems(OnEnter(GameState::GameOver), server_broadcast_snapshot.run_if(is_host))
             .add_systems(
                 FixedUpdate,
                 client_send_input
@@ -124,6 +131,8 @@ fn server_receive_inputs(
     mut nicknames: ResMut<PlayerNicknames>,
     mut chat_log: ResMut<ChatLog>,
     mut net_entities: ResMut<crate::net::NetEntities>,
+    mut dead_players: ResMut<crate::player::DeadPlayers>,
+    mut next_state: ResMut<NextState<GameState>>,
     players: Query<(Entity, &Player)>,
 ) {
     let Some(host) = ctx.host.as_ref() else {
@@ -151,6 +160,9 @@ fn server_receive_inputs(
                 if let Some(prev) = remote.0.get(&id) {
                     // Merge one-shot switch_slot to prevent lost inputs —
                     // sticky across ticks until the simulation consumes it.
+                    // `server_player_tick` zeroes the stored entry once it
+                    // applies the switch, so a consumed press reads as
+                    // prev.switch_slot == 0 here and is NOT resurrected.
                     if merged.switch_slot == 0 {
                         merged.switch_slot = prev.switch_slot;
                     }
@@ -171,6 +183,10 @@ fn server_receive_inputs(
             ServerEvent::Connected { id } => {
                 info!("Client {} connected mid-game (not spawning)", id);
             }
+            // Lobby-only bookkeeping; once the round is running the room
+            // code is fixed and a dropped signaling link can't hurt the
+            // already-established peer connections.
+            ServerEvent::RoomCode { .. } | ServerEvent::HostError { .. } => {}
             ServerEvent::Hello { id, nickname } => {
                 nicknames.0.insert(id, nickname);
             }
@@ -182,10 +198,24 @@ fn server_receive_inputs(
                 // otherwise it lingers as a stationary body forever, gets
                 // shipped in every snapshot, and still soaks up zombie
                 // collisions without being reachable by anyone.
-                if let Some(ent) = net_entities.players.remove(&id) {
+                let gone = net_entities.players.remove(&id);
+                if let Some(ent) = gone {
                     if players.get(ent).is_ok() {
                         commands.entity(ent).despawn_recursive();
                     }
+                }
+                // A player who died and then left must not come back as an
+                // uncontrolled ghost at the next wave clear / revive.
+                dead_players.0.retain(|p| *p != id);
+                // If that was the last one standing (the host itself may be
+                // dead and waiting for a respawn), the round is over — the
+                // death handler only fires on damage, so check here too.
+                let alive = players
+                    .iter()
+                    .filter(|(e, p)| Some(*e) != gone && p.hp > 0)
+                    .count();
+                if alive == 0 {
+                    next_state.set(GameState::GameOver);
                 }
             }
             ServerEvent::ChatRelay { id, text } => {
@@ -204,7 +234,7 @@ fn server_receive_inputs(
 }
 
 /// Tracks state needed to skip unchanged sub-fields between snapshots.
-#[derive(Default)]
+#[derive(Resource, Default)]
 struct BroadcastState {
     /// Sorted ids of last broadcast pickups — same set ⇒ skip the field.
     last_pickup_ids: Vec<u32>,
@@ -212,6 +242,13 @@ struct BroadcastState {
     /// of (id, nickname) pairs differs.  Cheap on a 4-player cap.
     last_nicknames: Vec<(u8, String)>,
     tick: u64,
+}
+
+/// Fresh delta baseline + tick counter for every round: with the previous
+/// round's pickup-id hash still around, the first snapshot of the next round
+/// would claim "pickups unchanged" and joiners would never see them.
+fn reset_broadcast_state(mut bcast: ResMut<BroadcastState>) {
+    *bcast = BroadcastState::default();
 }
 
 /// Low-churn scalar world state bundled into one `SystemParam` so
@@ -240,7 +277,7 @@ fn server_broadcast_snapshot(
     wave: Res<WaveState>,
     nicknames: Res<PlayerNicknames>,
     meta: SnapshotMeta,
-    mut bcast: Local<BroadcastState>,
+    mut bcast: ResMut<BroadcastState>,
 ) {
     let Some(host) = ctx.host.as_ref() else {
         return;
@@ -416,7 +453,9 @@ fn server_broadcast_snapshot(
     }
 }
 
-fn client_send_input(
+// pub(crate) so PlayerPlugin can order its `clear_one_shot_inputs` after the
+// packet (and its InputHistory copy) has shipped this tick's latched flags.
+pub(crate) fn client_send_input(
     ctx: Res<NetContext>,
     mut local: ResMut<LocalInput>,
     mut history: ResMut<crate::player::InputHistory>,
@@ -458,6 +497,7 @@ struct SnapshotApplyCtx<'w> {
     obstacles: Res<'w, MapObstacles>,
     chat_log: ResMut<'w, ChatLog>,
     died_evw: EventWriter<'w, PlayerDiedEvent>,
+    damaged_evw: EventWriter<'w, crate::player::PlayerDamagedEvent>,
     boss_spawn_evw: EventWriter<'w, crate::zombie::SpawnZombieEvent>,
     destroyed: ResMut<'w, crate::map::DestroyedExplodables>,
 }
@@ -600,6 +640,7 @@ fn client_apply_snapshots(
     let obstacles = &apply_ctx.obstacles;
     let chat_log = &mut apply_ctx.chat_log;
     let died_evw = &mut apply_ctx.died_evw;
+    let damaged_evw = &mut apply_ctx.damaged_evw;
     let boss_spawn_evw = &mut apply_ctx.boss_spawn_evw;
     let destroyed = &mut apply_ctx.destroyed;
     let Some(client) = ctx.client.as_ref() else {
@@ -624,6 +665,7 @@ fn client_apply_snapshots(
                     }
                 }
                 ClientInEvent::Disconnected
+                | ClientInEvent::ConnectFailed { .. }
                 | ClientInEvent::FullLobby
                 | ClientInEvent::GameInProgress
                 | ClientInEvent::ProtocolMismatch { .. } => {
@@ -645,6 +687,34 @@ fn client_apply_snapshots(
         history.clear();
         next_state.set(GameState::Menu);
         return;
+    }
+
+    // Several snapshots can land in one render frame (60 Hz sim vs. a slow
+    // frame, or a whole backlog after the tab was hidden).  Only the newest
+    // drives lifecycle, so the delta-encoded fields — `None` means "same as
+    // the previous snapshot" — must be carried forward into it, or a pickup
+    // change announced in a skipped snapshot is lost until the next change.
+    if scratch.new_snaps.len() > 1 {
+        let mut pickups = None;
+        let mut nicks = None;
+        for s in scratch.new_snaps.iter_mut() {
+            if s.pickups.is_some() {
+                pickups = s.pickups.take();
+            }
+            if s.player_nicknames.is_some() {
+                nicks = s.player_nicknames.take();
+            }
+        }
+        let last = scratch.new_snaps.last_mut().expect("len > 1");
+        last.pickups = pickups;
+        last.player_nicknames = nicks;
+        // A hidden tab can queue minutes of snapshots; the interpolation
+        // window only ever needs the last few.
+        const MAX_BACKLOG: usize = 4;
+        if scratch.new_snaps.len() > MAX_BACKLOG {
+            let drop = scratch.new_snaps.len() - MAX_BACKLOG;
+            scratch.new_snaps.drain(..drop);
+        }
     }
 
     // ── 2. Push new snapshots into the history buffer ─────────────────────
@@ -771,6 +841,15 @@ fn client_apply_snapshots(
             Some(ent) => {
                 if let Ok((mut t, mut p, mut lp)) = players.get_mut(ent) {
                     if has_new {
+                        // The host's damage systems don't run here, so the
+                        // local hit feedback (red flash) comes from watching
+                        // our own hp go down in the snapshot.
+                        if np.id == ctx.my_id && (np.hp as i32) < p.hp {
+                            damaged_evw.send(crate::player::PlayerDamagedEvent {
+                                target_id: np.id,
+                                amount: p.hp - np.hp as i32,
+                            });
+                        }
                         p.hp = np.hp as i32;
                         p.armor = np.armor as i32;
                         p.active_slot = np.active_slot;

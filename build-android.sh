@@ -24,6 +24,17 @@ echo "SDK : $ANDROID_HOME"
 echo "NDK : $ANDROID_NDK_ROOT"
 echo
 
+# Cargo.toml's release-signing config points at this git-ignored keystore, so
+# a fresh clone can't build until one exists — generate a local, self-signed,
+# throwaway key on the fly (fine for sideloading; replace with a managed
+# upload key for a store release).
+if [ ! -f release.keystore ]; then
+    echo "release.keystore missing — generating a throwaway signing key"
+    keytool -genkeypair -keystore release.keystore -alias zombie -keyalg RSA \
+        -keysize 2048 -validity 10000 -storepass zombiegame -keypass zombiegame \
+        -dname "CN=Zombiegame, O=Zombiegame, C=PL"
+fi
+
 cargo apk build --lib --release "$@"
 
 APK="target/release/apk/zombiegame2.apk"

@@ -1,10 +1,9 @@
 use bevy::prelude::*;
-use std::net::{IpAddr, SocketAddr};
 
 use crate::audio::SfxEvent;
 use crate::net::{
     sanitize_nickname, start_client, start_host, LocalNickname, NetContext, NetMode,
-    PlayerNicknames, NICKNAME_MAX_LEN, NET_PORT,
+    PlayerNicknames, NICKNAME_MAX_LEN, ROOM_CODE_LEN, ROOM_CODE_MAX_LEN,
 };
 use crate::settings::GraphicsSettings;
 use crate::{GameState, UiAssets};
@@ -17,6 +16,12 @@ pub struct MenuItem {
     pub index: usize,
 }
 
+/// The text inside a main-menu row (the row itself is `MenuItem`).
+#[derive(Component)]
+pub struct MenuItemLabel {
+    pub index: usize,
+}
+
 #[derive(Component)]
 pub struct MenuErrorText;
 
@@ -24,7 +29,7 @@ pub struct MenuErrorText;
 pub struct JoinPromptRoot;
 
 #[derive(Component)]
-pub struct JoinPromptIpText;
+pub struct JoinPromptCodeText;
 
 #[derive(Component)]
 pub struct JoinPromptNickText;
@@ -77,21 +82,47 @@ pub struct JoinAddress {
 impl Default for JoinAddress {
     fn default() -> Self {
         Self {
-            text: "127.0.0.1".to_string(),
+            text: String::new(),
             error: String::new(),
         }
     }
 }
 
+/// Invite link (`?room=CODE`, browser only): skip the main menu and land on
+/// the join screen with the code already typed — the player only adds a
+/// nick and presses Enter.
+fn open_invite_link(mut addr: ResMut<JoinAddress>, mut next_state: ResMut<NextState<GameState>>) {
+    #[cfg(target_arch = "wasm32")]
+    if let Some(code) = crate::net_web::room_from_url() {
+        addr.text = code;
+        next_state.set(GameState::JoinPrompt);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (&mut addr, &mut next_state);
+}
+
 const ITEMS: [&str; 7] = [
     "SINGLE PLAYER",
-    "HOST LAN",
-    "JOIN LAN",
+    "CREATE ROOM",
+    "JOIN ROOM",
     "SETTINGS",
     "ACHIEVEMENTS",
     "HOW TO PLAY",
     "QUIT",
 ];
+/// Position of QUIT in `ITEMS` — the Escape shortcut jumps there.
+const QUIT_INDEX: usize = 6;
+
+/// Main-menu rows for this platform.  The browser build drops QUIT: the tab
+/// is the app and `process::exit` has nothing to exit, so the row would be a
+/// dead button.
+fn menu_items() -> &'static [&'static str] {
+    if cfg!(target_arch = "wasm32") {
+        &ITEMS[..QUIT_INDEX]
+    } else {
+        &ITEMS
+    }
+}
 
 /// How long the QUIT confirm stays armed after an Escape / Back press; a
 /// second press inside this window actually exits.
@@ -157,6 +188,11 @@ fn settings_rows() -> &'static [SettingKind] {
     use SettingKind::*;
     if crate::mobile_profile() {
         &[Volume, Back]
+    } else if cfg!(target_arch = "wasm32") {
+        // Browser: the canvas is sized by the page and frames are paced by
+        // requestAnimationFrame, so resolution / window mode / vsync / fps
+        // cap have nothing to act on.
+        &[Volume, Quality, FpsCounter, ResetDefaults, Back]
     } else {
         &[
             Volume,
@@ -172,20 +208,28 @@ fn settings_rows() -> &'static [SettingKind] {
     }
 }
 
-const BG_COLOR: Color = Color::srgb(0.012, 0.016, 0.022);
-const PANEL_COLOR: Color = Color::srgba(0.035, 0.04, 0.05, 0.94);
-const PANEL_BORDER: Color = Color::srgb(0.22, 0.28, 0.32);
+pub(crate) const BG_COLOR: Color = Color::srgb(0.012, 0.016, 0.022);
+pub(crate) const PANEL_COLOR: Color = Color::srgba(0.035, 0.04, 0.05, 0.94);
+pub(crate) const PANEL_BORDER: Color = Color::srgb(0.22, 0.28, 0.32);
 const PANEL_BORDER_DARK: Color = Color::srgb(0.08, 0.1, 0.12);
 const ACCENT: Color = Color::srgb(0.42, 0.12, 0.08);
 const ACCENT_DIM: Color = Color::srgb(0.22, 0.07, 0.05);
 const TITLE_SHADOW: Color = Color::srgba(0.0, 0.0, 0.0, 0.95);
-const TEXT_DIM: Color = Color::srgb(0.32, 0.34, 0.38);
-const TEXT_NORMAL: Color = Color::srgb(0.55, 0.58, 0.62);
-const TEXT_HIGHLIGHT: Color = Color::srgb(0.82, 0.72, 0.28);
-const TEXT_SUBTITLE: Color = Color::srgb(0.48, 0.36, 0.2);
-const ERROR_COLOR: Color = Color::srgb(0.78, 0.24, 0.2);
-const VIGNETTE_COLOR: Color = Color::srgba(0.0, 0.0, 0.0, 0.58);
-const FOG_COLOR: Color = Color::srgba(0.08, 0.09, 0.11, 0.35);
+pub(crate) const TEXT_DIM: Color = Color::srgb(0.32, 0.34, 0.38);
+pub(crate) const TEXT_NORMAL: Color = Color::srgb(0.55, 0.58, 0.62);
+pub(crate) const TEXT_HIGHLIGHT: Color = Color::srgb(0.82, 0.72, 0.28);
+pub(crate) const TEXT_SUBTITLE: Color = Color::srgb(0.48, 0.36, 0.2);
+pub(crate) const ERROR_COLOR: Color = Color::srgb(0.78, 0.24, 0.2);
+/// Faint bar behind the selected menu row — the arrows carry the selection,
+/// this just anchors it.
+const HIGHLIGHT_BAR: Color = Color::srgba(0.82, 0.72, 0.28, 0.08);
+/// Every main-menu row is this wide so the highlight bar is one steady
+/// shape; the longest decorated label ("> SINGLE PLAYER <", 17 glyphs at
+/// 24 px ≈ 408 px) fits with room to spare inside the 560 px panel.
+const MENU_ITEM_WIDTH: f32 = 460.0;
+/// Standard menu panel: fixed width, 36 px inset, 3 px border.  Shared by
+/// the main menu, settings, join and lobby screens so they line up.
+pub(crate) const PANEL_WIDTH: f32 = 560.0;
 
 pub struct MenuPlugin;
 
@@ -195,6 +239,7 @@ impl Plugin for MenuPlugin {
             .init_resource::<SettingsSelection>()
             .init_resource::<MenuError>()
             .init_resource::<JoinAddress>()
+            .add_systems(Startup, open_invite_link)
             .init_resource::<JoinPromptUiState>()
             .add_systems(OnEnter(GameState::Menu), spawn_menu)
             .add_systems(OnExit(GameState::Menu), despawn_menu)
@@ -235,51 +280,46 @@ impl Plugin for MenuPlugin {
     }
 }
 
-fn spawn_background(parent: &mut ChildBuilder) {
-    parent.spawn(NodeBundle {
+/// Radial vignette for the menu screens: clear in the middle, darkening
+/// smoothly towards the edges so the panel reads as the lit part of the
+/// screen.  bevy_ui has no gradients, so it is a small generated texture
+/// stretched over the viewport with linear filtering.
+pub fn build_vignette_image() -> Image {
+    const W: i32 = 128;
+    const H: i32 = 72;
+    let mut canvas = crate::pixelart::Canvas::new(W, H);
+    for y in 0..H {
+        for x in 0..W {
+            let nx = (x as f32 + 0.5) / W as f32 * 2.0 - 1.0;
+            let ny = (y as f32 + 0.5) / H as f32 * 2.0 - 1.0;
+            let d = (nx * nx + ny * ny).sqrt();
+            // Untouched inside r=0.45, full strength at the corners (r≈1.4).
+            let t = ((d - 0.45) / 0.9).clamp(0.0, 1.0);
+            let a = t * t * (3.0 - 2.0 * t) * 0.8;
+            canvas.put(x, y, [0, 0, 0, (a * 255.0) as u8]);
+        }
+    }
+    let mut img = canvas.into_image();
+    img.sampler = bevy::render::texture::ImageSampler::linear();
+    img
+}
+
+/// Full-screen dressing behind every menu panel: the vignette plus a thin
+/// accent line along the top and bottom edges.  The root node's `BG_COLOR`
+/// is the ground it darkens.
+pub(crate) fn spawn_background(parent: &mut ChildBuilder, assets: &UiAssets) {
+    parent.spawn(ImageBundle {
         style: Style {
             position_type: PositionType::Absolute,
             left: Val::Px(0.0),
-            right: Val::Px(0.0),
             top: Val::Px(0.0),
-            bottom: Val::Px(0.0),
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
             ..default()
         },
-        background_color: BackgroundColor(FOG_COLOR),
+        image: UiImage::new(assets.vignette.clone()),
         ..default()
     });
-
-    for (left, top) in [
-        (Val::Px(0.0), Val::Px(0.0)),
-        (Val::Auto, Val::Px(0.0)),
-        (Val::Px(0.0), Val::Auto),
-        (Val::Auto, Val::Auto),
-    ] {
-        let right = if matches!(left, Val::Auto) {
-            Val::Px(0.0)
-        } else {
-            Val::Auto
-        };
-        let bottom = if matches!(top, Val::Auto) {
-            Val::Px(0.0)
-        } else {
-            Val::Auto
-        };
-        parent.spawn(NodeBundle {
-            style: Style {
-                position_type: PositionType::Absolute,
-                left,
-                top,
-                right,
-                bottom,
-                width: Val::Px(360.0),
-                height: Val::Px(260.0),
-                ..default()
-            },
-            background_color: BackgroundColor(VIGNETTE_COLOR),
-            ..default()
-        });
-    }
 
     parent.spawn(NodeBundle {
         style: Style {
@@ -331,7 +371,43 @@ fn spawn_background(parent: &mut ChildBuilder) {
     });
 }
 
-fn spawn_title_block(parent: &mut ChildBuilder, font: &Handle<Font>, title: &str) {
+/// The framed panel every menu screen is built in.
+pub(crate) fn panel_bundle() -> NodeBundle {
+    NodeBundle {
+        style: Style {
+            width: Val::Px(PANEL_WIDTH),
+            padding: UiRect::all(Val::Px(36.0)),
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::Center,
+            align_items: AlignItems::Center,
+            row_gap: Val::Px(10.0),
+            border: UiRect::all(Val::Px(3.0)),
+            ..default()
+        },
+        background_color: BackgroundColor(PANEL_COLOR),
+        border_color: BorderColor(PANEL_BORDER),
+        ..default()
+    }
+}
+
+/// Width of a panel's content box (`panel_bundle`: width minus padding and
+/// border) — what titles and hint lines must fit into.
+pub(crate) const PANEL_CONTENT_WIDTH: f32 = PANEL_WIDTH - 2.0 * 36.0 - 2.0 * 3.0;
+
+/// PressStart2P is an 8×8 pixel font: only sizes that are multiples of 8
+/// put every font pixel on whole screen pixels (anything else blurs into
+/// grey fringes).  Titles take the largest such size that still fits the
+/// panel — 64 for "ZOMBIES"/"JOIN"/"LOBBY", 56 for "SETTINGS".
+fn title_size(title: &str) -> f32 {
+    let fit = (PANEL_CONTENT_WIDTH / title.chars().count().max(1) as f32 / 8.0).floor() * 8.0;
+    fit.clamp(32.0, 64.0)
+}
+
+pub(crate) fn spawn_title_block(parent: &mut ChildBuilder, font: &Handle<Font>, title: &str) {
+    let size = title_size(title);
+    // One font pixel of drop shadow — an offset that isn't on the font's
+    // pixel grid renders as an uneven thin outline instead.
+    let shadow = size / 8.0;
     parent
         .spawn(NodeBundle {
             style: Style {
@@ -347,14 +423,14 @@ fn spawn_title_block(parent: &mut ChildBuilder, font: &Handle<Font>, title: &str
                     title,
                     TextStyle {
                         font: font.clone(),
-                        font_size: 72.0,
+                        font_size: size,
                         color: TITLE_SHADOW,
                     },
                 )
                 .with_style(Style {
                     position_type: PositionType::Absolute,
-                    left: Val::Px(4.0),
-                    top: Val::Px(4.0),
+                    left: Val::Px(shadow),
+                    top: Val::Px(shadow),
                     ..default()
                 }),
             );
@@ -362,14 +438,14 @@ fn spawn_title_block(parent: &mut ChildBuilder, font: &Handle<Font>, title: &str
                 title,
                 TextStyle {
                     font: font.clone(),
-                    font_size: 72.0,
+                    font_size: size,
                     color: ACCENT,
                 },
             ));
         });
 }
 
-fn spawn_divider(parent: &mut ChildBuilder) {
+pub(crate) fn spawn_divider(parent: &mut ChildBuilder) {
     parent.spawn(NodeBundle {
         style: Style {
             width: Val::Px(360.0),
@@ -405,29 +481,15 @@ fn spawn_menu(
             MenuRoot,
         ))
         .with_children(|root| {
-            spawn_background(root);
-            root.spawn(NodeBundle {
-                style: Style {
-                    width: Val::Px(560.0),
-                    padding: UiRect::all(Val::Px(36.0)),
-                    flex_direction: FlexDirection::Column,
-                    justify_content: JustifyContent::Center,
-                    align_items: AlignItems::Center,
-                    row_gap: Val::Px(10.0),
-                    border: UiRect::all(Val::Px(3.0)),
-                    ..default()
-                },
-                background_color: BackgroundColor(PANEL_COLOR),
-                border_color: BorderColor(PANEL_BORDER),
-                ..default()
-            })
+            spawn_background(root, &assets);
+            root.spawn(panel_bundle())
             .with_children(|panel| {
                 spawn_title_block(panel, &font, "ZOMBIES");
                 panel.spawn(TextBundle::from_section(
                     "WAVES  OF  SURVIVAL",
                     TextStyle {
                         font: font.clone(),
-                        font_size: 18.0,
+                        font_size: 16.0,
                         color: TEXT_SUBTITLE,
                     },
                 ));
@@ -444,31 +506,45 @@ fn spawn_menu(
                         ..default()
                     })
                     .with_children(|list| {
-                        for (i, label) in ITEMS.iter().enumerate() {
+                        for (i, label) in menu_items().iter().enumerate() {
+                            // A fixed-width row is the touch/click target
+                            // (`Interaction`) and carries the highlight bar;
+                            // the text is a child so it is centred for real —
+                            // bevy_ui 0.14 lays glyphs out from the node's
+                            // corner and ignores padding, so padding on the
+                            // text node itself shoved every label 30 px left.
                             list.spawn((
-                                TextBundle::from_section(
-                                    *label,
-                                    TextStyle {
-                                        font: font.clone(),
-                                        font_size: 24.0,
-                                        color: TEXT_NORMAL,
+                                NodeBundle {
+                                    style: Style {
+                                        width: Val::Px(MENU_ITEM_WIDTH),
+                                        padding: UiRect::vertical(Val::Px(8.0)),
+                                        justify_content: JustifyContent::Center,
+                                        align_items: AlignItems::Center,
+                                        ..default()
                                     },
-                                )
-                                // Padding enlarges the node's box so it's a
-                                // comfortable touch target, not just the glyph
-                                // bounds.  `Interaction` makes bevy_ui hit-test
-                                // taps/clicks against it (handles touch + DPI).
-                                .with_style(Style {
-                                    padding: UiRect::axes(Val::Px(30.0), Val::Px(10.0)),
+                                    background_color: BackgroundColor(Color::NONE),
                                     ..default()
-                                })
-                                // Selection decorations must never word-wrap —
-                                // a wrapped "<" doubles the item's height and
-                                // the whole column visibly jumps.
-                                .with_no_wrap(),
+                                },
                                 MenuItem { index: i },
                                 Interaction::default(),
-                            ));
+                            ))
+                            .with_children(|row| {
+                                row.spawn((
+                                    TextBundle::from_section(
+                                        *label,
+                                        TextStyle {
+                                            font: font.clone(),
+                                            font_size: 24.0,
+                                            color: TEXT_NORMAL,
+                                        },
+                                    )
+                                    // Selection decorations must never
+                                    // word-wrap — a wrapped "<" doubles the
+                                    // row's height and the column jumps.
+                                    .with_no_wrap(),
+                                    MenuItemLabel { index: i },
+                                ));
+                            });
                         }
                     });
                 spawn_divider(panel);
@@ -477,7 +553,7 @@ fn spawn_menu(
                         "",
                         TextStyle {
                             font: font.clone(),
-                            font_size: 12.0,
+                            font_size: 16.0,
                             color: ERROR_COLOR,
                         },
                     )
@@ -487,17 +563,17 @@ fn spawn_menu(
                     // toggles.  min_height, not height — real errors ("Host
                     // fail: …") may still wrap onto more lines.
                     .with_style(Style {
-                        min_height: Val::Px(14.0),
+                        min_height: Val::Px(18.0),
                         ..default()
                     }),
                     MenuErrorText,
                 ));
                 panel.spawn(
                     TextBundle::from_section(
-                        "ARROWS - SELECT     ENTER - CONFIRM",
+                        "ARROWS - SELECT   ENTER - OK",
                         TextStyle {
                             font,
-                            font_size: 11.0,
+                            font_size: 16.0,
                             color: TEXT_DIM,
                         },
                     )
@@ -555,12 +631,13 @@ fn menu_navigate(
 ) {
     let up = keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyW);
     let down = keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyS);
+    let item_count = menu_items().len();
     if up {
-        selection.0 = (selection.0 + ITEMS.len() - 1) % ITEMS.len();
+        selection.0 = (selection.0 + item_count - 1) % item_count;
         sfx.send(SfxEvent::MenuMove);
     }
     if down {
-        selection.0 = (selection.0 + 1) % ITEMS.len();
+        selection.0 = (selection.0 + 1) % item_count;
         sfx.send(SfxEvent::MenuMove);
     }
     // A pending quit confirm lapses after a short window, and moving the
@@ -587,9 +664,11 @@ fn menu_navigate(
                     .insert(0, sanitize_nickname(&local_nick.0));
                 next_state.set(GameState::Playing);
             }
-            1 => match start_host() {
+            1 => match {
+                ctx.disconnect();
+                start_host()
+            } {
                 Ok(host) => {
-                    ctx.disconnect();
                     ctx.host = Some(host);
                     ctx.my_id = 0;
                     ctx.lobby_players = vec![0];
@@ -602,7 +681,7 @@ fn menu_navigate(
                     next_state.set(GameState::Lobby);
                 }
                 Err(e) => {
-                    error.0 = format!("Host fail: {e}");
+                    error.0 = e;
                 }
             },
             2 => {
@@ -621,7 +700,7 @@ fn menu_navigate(
                 error.0.clear();
                 next_state.set(GameState::Guide);
             }
-            6 => {
+            QUIT_INDEX => {
                 // Enter (including the tap-injected one from
                 // `menu_touch_select`) goes through the same two-step confirm
                 // as Escape — one stray press/tap on the QUIT row's big touch
@@ -636,18 +715,19 @@ fn menu_navigate(
             _ => {}
         }
     }
-    if keys.just_pressed(KeyCode::Escape) {
-        // Esc moves the cursor onto QUIT (index 6) — a second Esc (or Enter)
-        // there within a short window exits.  This stops accidentally killing
-        // the app when a player just wanted to back out of a sub-menu; the
+    // No QUIT row in the browser build — Escape on the main menu is a no-op.
+    if keys.just_pressed(KeyCode::Escape) && item_count > QUIT_INDEX {
+        // Esc moves the cursor onto QUIT — a second Esc (or Enter) there
+        // within a short window exits.  This stops accidentally killing the
+        // app when a player just wanted to back out of a sub-menu; the
         // mobile Back nav button injects this same Escape.
-        if selection.0 == 6 && quit_armed.is_some() {
+        if selection.0 == QUIT_INDEX && quit_armed.is_some() {
             sfx.send(SfxEvent::MenuSelect);
             ctx.disconnect();
             std::process::exit(0);
         }
-        if selection.0 != 6 {
-            selection.0 = 6;
+        if selection.0 != QUIT_INDEX {
+            selection.0 = QUIT_INDEX;
             sfx.send(SfxEvent::MenuMove);
         }
         *quit_armed = Some(now);
@@ -655,13 +735,20 @@ fn menu_navigate(
     }
 }
 
-fn menu_highlight(selection: Res<MenuSelection>, mut items: Query<(&MenuItem, &mut Text)>) {
+fn menu_highlight(
+    selection: Res<MenuSelection>,
+    mut rows: Query<(&MenuItem, &mut BackgroundColor)>,
+    mut items: Query<(&MenuItemLabel, &mut Text)>,
+) {
     if !selection.is_changed() && !selection.is_added() {
         return;
     }
+    for (row, mut bg) in &mut rows {
+        bg.0 = if row.index == selection.0 { HIGHLIGHT_BAR } else { Color::NONE };
+    }
     for (item, mut text) in &mut items {
         let selected = item.index == selection.0;
-        let label = ITEMS[item.index];
+        let label = menu_items()[item.index];
         // Single-space decorations keep the longest label ("SINGLE PLAYER",
         // 17 chars decorated) inside the 560px panel's content box even with
         // the 30px touch padding — the old double-space variant hit 19 chars
@@ -709,22 +796,8 @@ fn spawn_settings(
             SettingsRoot,
         ))
         .with_children(|root| {
-            spawn_background(root);
-            root.spawn(NodeBundle {
-                style: Style {
-                    width: Val::Px(620.0),
-                    padding: UiRect::all(Val::Px(36.0)),
-                    flex_direction: FlexDirection::Column,
-                    align_items: AlignItems::Center,
-                    row_gap: Val::Px(10.0),
-                    border: UiRect::all(Val::Px(3.0)),
-                    ..default()
-                },
-                background_color: BackgroundColor(PANEL_COLOR),
-                border_color: BorderColor(PANEL_BORDER),
-                ..default()
-            })
-            .with_children(|panel| {
+            spawn_background(root, &assets);
+            root.spawn(panel_bundle()).with_children(|panel| {
                 spawn_title_block(panel, &font, "SETTINGS");
                 panel.spawn(TextBundle::from_section(
                     // Mobile shows only the volume row, so "GRAPHICS" would lie.
@@ -755,10 +828,10 @@ fn spawn_settings(
                 spawn_divider(panel);
                 panel.spawn(
                     TextBundle::from_section(
-                        "ARROWS - CHANGE     ESC - BACK",
+                        "ARROWS - CHANGE   ESC - BACK",
                         TextStyle {
                             font,
-                            font_size: 11.0,
+                            font_size: 16.0,
                             color: TEXT_DIM,
                         },
                     )
@@ -796,7 +869,7 @@ fn spawn_settings_row(
             kind.label(),
             TextStyle {
                 font: font.clone(),
-                font_size: 18.0,
+                font_size: 16.0,
                 color: TEXT_NORMAL,
             },
         ));
@@ -806,7 +879,7 @@ fn spawn_settings_row(
                 value,
                 TextStyle {
                     font: font.clone(),
-                    font_size: 18.0,
+                    font_size: 16.0,
                     color: TEXT_NORMAL,
                 },
             ),
@@ -956,25 +1029,11 @@ fn spawn_join_prompt(
             JoinPromptRoot,
         ))
         .with_children(|root| {
-            spawn_background(root);
-            root.spawn(NodeBundle {
-                style: Style {
-                    width: Val::Px(560.0),
-                    padding: UiRect::all(Val::Px(36.0)),
-                    flex_direction: FlexDirection::Column,
-                    align_items: AlignItems::Center,
-                    row_gap: Val::Px(12.0),
-                    border: UiRect::all(Val::Px(3.0)),
-                    ..default()
-                },
-                background_color: BackgroundColor(PANEL_COLOR),
-                border_color: BorderColor(PANEL_BORDER),
-                ..default()
-            })
-            .with_children(|panel| {
+            spawn_background(root, &assets);
+            root.spawn(panel_bundle()).with_children(|panel| {
                 spawn_title_block(panel, &font, "JOIN");
                 panel.spawn(TextBundle::from_section(
-                    "LAN MODE",
+                    "BY ROOM CODE",
                     TextStyle {
                         font: font.clone(),
                         font_size: 16.0,
@@ -983,10 +1042,10 @@ fn spawn_join_prompt(
                 ));
                 spawn_divider(panel);
                 panel.spawn(TextBundle::from_section(
-                    format!("NICK (LITERY, MAX {} ZNAKOW):", NICKNAME_MAX_LEN),
+                    format!("NICK (LETTERS, MAX {}):", NICKNAME_MAX_LEN),
                     TextStyle {
                         font: font.clone(),
-                        font_size: 13.0,
+                        font_size: 16.0,
                         color: TEXT_DIM,
                     },
                 ));
@@ -995,7 +1054,7 @@ fn spawn_join_prompt(
                         format!("NICK: {}_", nick.0),
                         TextStyle {
                             font: font.clone(),
-                            font_size: 22.0,
+                            font_size: 24.0,
                             color: TEXT_HIGHLIGHT,
                         },
                     )
@@ -1007,19 +1066,19 @@ fn spawn_join_prompt(
                 ));
                 spawn_divider(panel);
                 panel.spawn(TextBundle::from_section(
-                    "ENTER HOST IP (DIGITS AND DOTS):",
+                    "ENTER ROOM CODE:",
                     TextStyle {
                         font: font.clone(),
-                        font_size: 13.0,
+                        font_size: 16.0,
                         color: TEXT_DIM,
                     },
                 ));
                 panel.spawn((
                     TextBundle::from_section(
-                        format!("IP: {}", addr.text),
+                        format!("CODE: {}", addr.text),
                         TextStyle {
                             font: font.clone(),
-                            font_size: 22.0,
+                            font_size: 24.0,
                             color: TEXT_NORMAL,
                         },
                     )
@@ -1027,28 +1086,33 @@ fn spawn_join_prompt(
                         margin: UiRect::vertical(Val::Px(4.0)),
                         ..default()
                     }),
-                    JoinPromptIpText,
+                    JoinPromptCodeText,
                 ));
                 panel.spawn((
                     TextBundle::from_section(
                         "",
                         TextStyle {
                             font: font.clone(),
-                            font_size: 12.0,
+                            font_size: 16.0,
                             color: ERROR_COLOR,
                         },
                     ),
                     JoinPromptErrorText,
                 ));
                 spawn_divider(panel);
-                panel.spawn(TextBundle::from_section(
-                    "TAB - SWITCH FIELD   ENTER - CONNECT   ESC - BACK",
-                    TextStyle {
-                        font,
-                        font_size: 10.0,
-                        color: TEXT_DIM,
-                    },
-                ));
+                // Two nodes rather than one two-line text: PressStart2P's
+                // line height equals its glyph height, so wrapped lines
+                // touch; the panel's row gap spaces these properly.
+                for hint in ["TAB - FIELD   ENTER - JOIN", "ESC - BACK"] {
+                    panel.spawn(TextBundle::from_section(
+                        hint,
+                        TextStyle {
+                            font: font.clone(),
+                            font_size: 16.0,
+                            color: TEXT_DIM,
+                        },
+                    ));
+                }
             });
         });
 }
@@ -1063,7 +1127,7 @@ fn reset_join_prompt_state(mut s: ResMut<JoinPromptUiState>) {
     s.nick_active = true;
 }
 
-fn keycode_to_digit(k: KeyCode) -> Option<char> {
+pub(crate) fn keycode_to_digit(k: KeyCode) -> Option<char> {
     match k {
         KeyCode::Digit0 | KeyCode::Numpad0 => Some('0'),
         KeyCode::Digit1 | KeyCode::Numpad1 => Some('1'),
@@ -1079,7 +1143,7 @@ fn keycode_to_digit(k: KeyCode) -> Option<char> {
     }
 }
 
-fn keycode_to_letter(k: KeyCode) -> Option<char> {
+pub(crate) fn keycode_to_letter(k: KeyCode) -> Option<char> {
     match k {
         KeyCode::KeyA => Some('A'),
         KeyCode::KeyB => Some('B'),
@@ -1120,10 +1184,10 @@ fn join_prompt_input(
     mut ctx: ResMut<NetContext>,
     mut net_mode: ResMut<NetMode>,
     mut next_state: ResMut<NextState<GameState>>,
-    mut ip_text: Query<
+    mut code_text: Query<
         &mut Text,
         (
-            With<JoinPromptIpText>,
+            With<JoinPromptCodeText>,
             Without<JoinPromptErrorText>,
             Without<JoinPromptNickText>,
         ),
@@ -1133,21 +1197,21 @@ fn join_prompt_input(
         (
             With<JoinPromptNickText>,
             Without<JoinPromptErrorText>,
-            Without<JoinPromptIpText>,
+            Without<JoinPromptCodeText>,
         ),
     >,
     mut err_text: Query<
         &mut Text,
         (
             With<JoinPromptErrorText>,
-            Without<JoinPromptIpText>,
+            Without<JoinPromptCodeText>,
             Without<JoinPromptNickText>,
         ),
     >,
     mut sfx: EventWriter<SfxEvent>,
 ) {
     // Default to nick field on first appearance.  We start with nick active
-    // so the player types their name first and TABs to the IP.
+    // so the player types their name first and TABs to the room code.
     if keys.just_pressed(KeyCode::Tab) {
         ui_state.nick_active = !ui_state.nick_active;
         sfx.send(SfxEvent::MenuMove);
@@ -1176,15 +1240,9 @@ fn join_prompt_input(
                 changed = true;
                 sfx.send(SfxEvent::MenuMove);
             }
-        } else if let Some(d) = keycode_to_digit(*key) {
-            if addr.text.len() < 21 {
-                addr.text.push(d);
-                changed = true;
-                sfx.send(SfxEvent::MenuMove);
-            }
-        } else if matches!(key, KeyCode::Period | KeyCode::NumpadDecimal) {
-            if addr.text.len() < 21 {
-                addr.text.push('.');
+        } else if let Some(c) = keycode_to_letter(*key).or_else(|| keycode_to_digit(*key)) {
+            if addr.text.chars().count() < ROOM_CODE_MAX_LEN {
+                addr.text.push(c.to_ascii_uppercase());
                 changed = true;
                 sfx.send(SfxEvent::MenuMove);
             }
@@ -1207,11 +1265,11 @@ fn join_prompt_input(
                 TEXT_NORMAL
             };
         }
-        if let Ok(mut text) = ip_text.get_single_mut() {
+        if let Ok(mut text) = code_text.get_single_mut() {
             text.sections[0].value = if ui_state.nick_active {
-                format!("IP: {}", addr.text)
+                format!("CODE: {}", addr.text)
             } else {
-                format!("IP: {}_", addr.text)
+                format!("CODE: {}_", addr.text)
             };
             text.sections[0].style.color = if ui_state.nick_active {
                 TEXT_NORMAL
@@ -1227,30 +1285,29 @@ fn join_prompt_input(
     }
     if keys.just_pressed(KeyCode::Enter) {
         sfx.send(SfxEvent::MenuSelect);
-        let parse: Result<IpAddr, _> = addr.text.parse();
-        match parse {
-            Ok(ip) => {
-                let sock = SocketAddr::new(ip, NET_PORT);
-                let clean_nick = sanitize_nickname(&nick.0);
-                nick.0 = clean_nick.clone();
-                match start_client(sock, &clean_nick) {
-                    Ok(client) => {
-                        ctx.disconnect();
-                        ctx.client = Some(client);
-                        *net_mode = NetMode::Client;
-                        addr.error.clear();
-                        next_state.set(GameState::Lobby);
-                    }
-                    Err(e) => {
-                        addr.error = format!("Error: {e}");
-                        if let Ok(mut t) = err_text.get_single_mut() {
-                            t.sections[0].value = addr.error.clone();
-                        }
-                    }
-                }
+        let code = addr.text.trim().to_ascii_uppercase();
+        if code.len() < ROOM_CODE_LEN {
+            addr.error = format!("ENTER THE {ROOM_CODE_LEN}-CHAR ROOM CODE");
+            if let Ok(mut t) = err_text.get_single_mut() {
+                t.sections[0].value = addr.error.clone();
             }
-            Err(_) => {
-                addr.error = "Invalid IP".to_string();
+            return;
+        }
+        let clean_nick = sanitize_nickname(&nick.0);
+        nick.0 = clean_nick.clone();
+        ctx.disconnect();
+        match start_client(&code, &clean_nick) {
+            Ok(client) => {
+                // Connecting is asynchronous — the lobby shows CONNECTING...
+                // and falls back to the menu (with the reason) on failure.
+                ctx.client = Some(client);
+                ctx.room_code = code;
+                *net_mode = NetMode::Client;
+                addr.error.clear();
+                next_state.set(GameState::Lobby);
+            }
+            Err(e) => {
+                addr.error = e;
                 if let Ok(mut t) = err_text.get_single_mut() {
                     t.sections[0].value = addr.error.clone();
                 }

@@ -6,7 +6,6 @@ use crate::map::{
     bfs_distance_field, in_bounds, nav_idx, spawn_point_world, tile_center, world_to_tile,
     MapObstacles, MapSegmentUnlockState, NavGrid, SpawnPointSpec, SPAWN_POINTS, TILE_SIZE,
 };
-use crate::zones::ZoneState;
 use crate::net::{is_authoritative, NetContext, NetEntities, NetId};
 use crate::pixelart::{Canvas, Rgba};
 use crate::player::{DeadPlayers, Player, PlayerDamagedEvent, PlayerDiedEvent, PLAYER_RADIUS};
@@ -1265,11 +1264,9 @@ fn spawn_zombie_listener(
     mut events: EventReader<SpawnZombieEvent>,
     assets: Res<ZombieAssets>,
     mut ctx: ResMut<NetContext>,
-    _zone_state: Res<ZoneState>,
     nav: Res<NavGrid>,
     segments: Res<MapSegmentUnlockState>,
     existing: Query<(), With<Zombie>>,
-    players: Query<&Transform, With<Player>>,
 ) {
     // Waves feed at most a few spawns per second while this runs at 60 Hz —
     // skip the alive count and spawn-point Vec builds on event-less ticks.
@@ -1292,41 +1289,11 @@ fn spawn_zombie_listener(
         .filter(|s| s.interior_only && segments.is_unlocked(s.segment_idx))
         .collect();
 
-    // Detect whether any player has descended into the metro level — if so
-    // we route a fraction of spawns to a fixed underground spawn so the
-    // tunnel actually fills up with zombies "leaking down from upstairs".
-    let any_player_underground = players
-        .iter()
-        .any(|t| t.translation.y < crate::underground::UNDER_TOP);
-
     for ev in events.read() {
         if alive + spawned >= MAX_ALIVE_ZOMBIES {
             continue;
         }
         spawned += 1;
-
-        // 60% of the time, when any player is in the metro, spawn this
-        // zombie underground at the manhole drop point (on the platform).
-        if any_player_underground && rng.gen_bool(0.6) {
-            let pos = Vec2::new(
-                crate::underground::MANHOLE_X + rng.gen_range(-30.0..30.0),
-                crate::underground::UNDER_TOP - 100.0 + rng.gen_range(-20.0..20.0),
-            );
-            let base = ev.kind.base_speed();
-            let jitter: f32 = rng.gen_range(-12.0..18.0);
-            let speed = base + jitter;
-            let net_id = ctx.alloc_zombie_id();
-            spawn_zombie_entity(
-                &mut commands,
-                &assets,
-                pos,
-                net_id,
-                ev.kind.base_hp(),
-                speed,
-                ev.kind,
-            );
-            continue;
-        }
 
         let pool: &Vec<&SpawnPointSpec> = if matches!(ev.kind, ZombieKind::Fast)
             && !interior.is_empty()
@@ -1608,12 +1575,30 @@ fn zombie_movement(
             continue;
         };
 
-        let flow = zombie_flow_direction(&nav, pos, target)
-            .unwrap_or_else(|| (target - pos).normalize_or_zero());
+        // Inside the last couple of tiles the flow field is too coarse to
+        // finish the job: a player hugging furniture stands in a nav-blocked
+        // clearance tile the field never enters, so zombies would park ~40 px
+        // away forever and never reach contact range.  Close in, go straight
+        // for the player — `obstacles.resolve` below still keeps the zombie
+        // out of the furniture itself.
+        const CLOSE_RANGE: f32 = 2.0 * crate::map::TILE_SIZE;
+        let close = pos.distance_squared(target) < CLOSE_RANGE * CLOSE_RANGE;
+        let flow = if close {
+            (target - pos).normalize_or_zero()
+        } else {
+            zombie_flow_direction(&nav, pos, target)
+                .unwrap_or_else(|| (target - pos).normalize_or_zero())
+        };
         let escaping = znav.escape_timer > 0.0;
         let dir = if escaping {
             znav.escape_timer -= dt;
             znav.escape_dir
+        } else if close {
+            // No obstacle steering this close either: the look-ahead probe
+            // would see the furniture *behind* the player and deflect the
+            // zombie sideways, leaving it orbiting a few px outside contact
+            // range.  `resolve` alone is enough to stay out of the prop.
+            flow
         } else {
             let (dir, sign) = steer_around_obstacles(pos, flow, &obstacles, radius, znav.avoid_sign);
             znav.avoid_sign = sign;
@@ -1716,7 +1701,10 @@ fn zombie_attack(
                 continue;
             }
             let p = pt.translation.truncate();
-            let r = PLAYER_RADIUS + zr;
+            // Small slack: a zombie pinned against the player by collision
+            // resolution sits at exactly touching distance, and an exact
+            // "<" would never fire.
+            let r = PLAYER_RADIUS + zr + 2.0;
             if p.distance_squared(zp) < r * r {
                 match zombie.kind {
                     ZombieKind::Exploder => {
@@ -1732,11 +1720,16 @@ fn zombie_attack(
                         // continuous contact would refresh `remaining` every tick,
                         // making the effect impossible to outlast and discarding
                         // the partial `accumulated` damage from the prior frame.
+                        // `get_entity` + `try_insert`: the player may have
+                        // been despawned this very tick (disconnect), and a
+                        // plain `entity().insert()` on it panics the host.
                         if burn.is_none() {
-                            commands.entity(p_ent).insert(BurnEffect {
-                                remaining: BURN_DURATION,
-                                accumulated: 0.0,
-                            });
+                            if let Some(mut ec) = commands.get_entity(p_ent) {
+                                ec.try_insert(BurnEffect {
+                                    remaining: BURN_DURATION,
+                                    accumulated: 0.0,
+                                });
+                            }
                         }
                     }
                     _ => {

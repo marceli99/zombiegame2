@@ -16,6 +16,13 @@ pub struct WaveState {
     pub spawn_timer: Timer,
     pub break_timer: Timer,
     pub in_break: bool,
+    /// Consecutive ticks the clear condition (queue empty + no live zombies)
+    /// has held.  The final `SpawnZombieEvent` may still be in flight —
+    /// `spawn_zombie_listener` (ZombiePlugin, no ordering edge to
+    /// `wave_system`) can consume it a tick after the send and materializes
+    /// the zombie via deferred commands — so one empty observation isn't
+    /// proof the wave is actually done.
+    pub clear_streak: u8,
 }
 
 impl Default for WaveState {
@@ -27,6 +34,7 @@ impl Default for WaveState {
             spawn_timer: Timer::from_seconds(0.25, TimerMode::Repeating),
             break_timer: Timer::from_seconds(2.5, TimerMode::Once),
             in_break: true,
+            clear_streak: 0,
         }
     }
 }
@@ -140,6 +148,15 @@ fn wave_system(
             }
         }
     } else if zombies.is_empty() {
+        // Require two consecutive empty ticks: a zombie sent on the queue's
+        // last pop can take until the next tick to reach the query (see
+        // `clear_streak` docs), and clearing early would start the break
+        // with a straggler still incoming.
+        state.clear_streak += 1;
+        if state.clear_streak < 2 {
+            return;
+        }
+        state.clear_streak = 0;
         // Wave cleared — respawn dead players before the break
         for (i, id) in dead_players.0.drain(..).enumerate() {
             let col = i % 4;
@@ -156,5 +173,7 @@ fn wave_system(
         }
         state.in_break = true;
         state.break_timer.reset();
+    } else {
+        state.clear_streak = 0;
     }
 }

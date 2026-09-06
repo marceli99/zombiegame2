@@ -24,7 +24,7 @@ use crate::chat::ChatInputState;
 use crate::net::{LocalInput, NetContext};
 use crate::player::Player;
 use crate::zombie::Zombie;
-use crate::{GameState, UiAssets};
+use crate::{GameState, PauseState, UiAssets};
 
 // ── Tuning ──────────────────────────────────────────────────────────────
 const GP_MOVE_DEADZONE: f32 = 0.25;
@@ -627,7 +627,7 @@ fn read_touch_gameplay(
         }
     }
 
-    // Held interact button (revive / manhole channels need hold-progress).
+    // Held interact button (the revive channel needs hold-progress).
     for t in touches.iter() {
         let p = t.position();
         if let Some((Btn::Interact, _, _)) =
@@ -666,9 +666,13 @@ fn apply_virtual_to_local(
     v: Res<VirtualInput>,
     chat: Res<ChatInputState>,
     game: Res<State<GameState>>,
+    pause: Res<State<PauseState>>,
     mut local: ResMut<LocalInput>,
 ) {
-    if *game.get() != GameState::Playing || chat.open {
+    // Bail while paused too — gather_local_input zeroes LocalInput under a
+    // pause overlay, and writing touch input back would leave an MP client
+    // walking and firing behind the menu.
+    if *game.get() != GameState::Playing || chat.open || *pause.get() == PauseState::Paused {
         return;
     }
     if v.move_dir.length() > 0.05 {

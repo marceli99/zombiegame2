@@ -1,0 +1,5 @@
+target/
+.git/
+release.keystore
+res/
+ios/

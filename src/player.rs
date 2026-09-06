@@ -13,7 +13,7 @@ use crate::net::{
 };
 use crate::pixelart::{Canvas, Rgba};
 use crate::weapon::{ThrowableKind, Weapon};
-use crate::{gameplay_active, GameState, Score};
+use crate::{gameplay_active, GameState, PauseState, Score};
 
 const PLAYER_SPRITE_SIZE: Vec2 = Vec2::new(30.0, 25.0);
 
@@ -208,6 +208,10 @@ impl Plugin for PlayerPlugin {
             .add_systems(Startup, setup_player_assets)
             .add_systems(OnEnter(GameState::Playing), spawn_players)
             .add_systems(OnExit(GameState::Playing), despawn_players)
+            // A one-shot latched on the round's final frame has no fixed tick
+            // left to consume it — drop it so a rematch doesn't start with a
+            // stale grenade throw / reload / slot switch.
+            .add_systems(OnExit(GameState::Playing), clear_one_shot_inputs)
             .add_systems(
                 Update,
                 (gather_local_input, emit_walking_dust, update_reload_bar)
@@ -261,6 +265,21 @@ impl Plugin for PlayerPlugin {
                 client_local_predict
                     .run_if(in_state(GameState::Playing))
                     .run_if(is_net_client),
+            )
+            // Post-consume clear for the latched one-shot inputs.  Ordered
+            // after every fixed-tick consumer: the SP/host sim, client-side
+            // prediction, and the client's packet send — the outgoing packet
+            // and the InputHistory entry used by reconciliation replay must
+            // still carry the values.  `gameplay_active` matches the
+            // consumers' own gating: during an SP pause nothing consumed the
+            // latch, so it survives until the sim resumes.
+            .add_systems(
+                FixedUpdate,
+                clear_one_shot_inputs
+                    .after(server_player_tick)
+                    .after(client_local_predict)
+                    .after(crate::sync::client_send_input)
+                    .run_if(gameplay_active),
             );
     }
 }
@@ -525,7 +544,11 @@ fn spawn_players(
 fn despawn_players(
     mut commands: Commands,
     q: Query<Entity, With<Player>>,
-    bars: Query<Entity, With<ReloadBarRoot>>,
+    // Both reload-bar entities: `spawn_reload_bar` creates a fresh
+    // background + fill pair on every OnEnter(Playing), so leaving the fill
+    // behind would leak one entity per session and break
+    // `update_reload_bar`'s `get_single_mut` for every later round.
+    bars: Query<Entity, Or<(With<ReloadBarRoot>, With<ReloadBarFill>)>>,
     mut net_entities: ResMut<NetEntities>,
 ) {
     for e in &q {
@@ -675,18 +698,24 @@ pub(crate) fn gather_local_input(
     players: Query<(&Transform, &Player)>,
     ctx: Res<NetContext>,
     chat: Res<crate::chat::ChatInputState>,
+    pause: Res<State<PauseState>>,
     mut local: ResMut<LocalInput>,
 ) {
     // Block player controls while the chat box is open — letters typed for
-    // a message must not also drive movement / weapon switching.  Aim still
-    // tracks the cursor so the player isn't disoriented when they close.
-    if chat.open {
+    // a message must not also drive movement / weapon switching.  Same while
+    // the pause menu is up: in MP the world keeps running behind the local
+    // overlay, and without this guard WASD still walks the character and
+    // stray clicks fire the weapon while the player reads the menu.
+    if chat.open || *pause.get() == PauseState::Paused {
         local.0.move_x = 0.0;
         local.0.move_y = 0.0;
         local.0.shoot = false;
         local.0.throw = false;
         local.0.reload = false;
         local.0.interact = false;
+        // Also drop the hold flag — otherwise an E held down when the
+        // overlay opened would keep channeling a revive behind the menu.
+        local.0.interact_held = false;
         local.0.switch_slot = 0;
         return;
     }
@@ -707,8 +736,17 @@ pub(crate) fn gather_local_input(
     local.0.move_x = mv.x;
     local.0.move_y = mv.y;
     local.0.shoot = mouse.pressed(MouseButton::Left);
-    local.0.throw = mouse.just_pressed(MouseButton::Right);
-    local.0.reload = keys.just_pressed(KeyCode::KeyR);
+    // Throw / reload are edge-triggered like interact: latch on press so the
+    // value survives the extra render frames between 60 Hz fixed ticks — at
+    // 144/240 FPS the next frame's `just_pressed` would overwrite it back to
+    // false before FixedUpdate ever saw it.  Cleared by
+    // `clear_one_shot_inputs` once the fixed-tick consumers have run.
+    if mouse.just_pressed(MouseButton::Right) {
+        local.0.throw = true;
+    }
+    if keys.just_pressed(KeyCode::KeyR) {
+        local.0.reload = true;
+    }
 
     // Interact (E) — segment unlock confirmation.  Latch on press so the
     // value reaches FixedUpdate even if input arrived between ticks; cleared
@@ -716,11 +754,13 @@ pub(crate) fn gather_local_input(
     if keys.just_pressed(KeyCode::KeyE) {
         local.0.interact = true;
     }
-    // Hold variant for revive / manhole channels — replaces every tick so a
+    // Hold variant for the revive channel — replaces every tick so a
     // released key cleanly stops the progress accumulator.
     local.0.interact_held = keys.pressed(KeyCode::KeyE);
 
-    // Slot switching (sticky: only set, never clear — FixedUpdate may run less often than Update)
+    // Slot switching — latched like throw/reload above (FixedUpdate may run
+    // less often than Update); cleared by `clear_one_shot_inputs` after the
+    // fixed-tick consumers have run.
     if keys.just_pressed(KeyCode::Digit1) {
         local.0.switch_slot = 1;
     } else if keys.just_pressed(KeyCode::Digit2) {
@@ -756,6 +796,28 @@ pub(crate) fn gather_local_input(
     }
 }
 
+/// Clears the latched one-shot inputs (throw / reload / slot switch) after
+/// every FixedUpdate consumer has had a shot at them this tick — the
+/// Update-side latch in `gather_local_input` (and mobile's
+/// `apply_virtual_to_local`) re-arms them on the next press.  Mirrors the
+/// `clear_interact_flag` pattern in map.rs.  Without this, `switch_slot`
+/// latched forever: one '1' press kept reverting every later weapon pickup
+/// back to the pistol, and a stale '3' force-selected the throwable slot the
+/// moment grenades were collected.
+fn clear_one_shot_inputs(mut local: ResMut<LocalInput>) {
+    local.0.throw = false;
+    local.0.reload = false;
+    local.0.switch_slot = 0;
+}
+
+/// Clamp a player's Y to the map band (the perimeter walls sit just outside
+/// it, so this is the hard stop at the spawn gaps).
+#[inline]
+fn clamp_player_y(y: f32) -> f32 {
+    let half = crate::map::MAP_HEIGHT * 0.5 - PLAYER_RADIUS;
+    y.clamp(-half, half)
+}
+
 /// One step of client-side prediction: applies a single `NetInput` to a
 /// local player's transform & component state.  Mirrors the relevant subset
 /// of `server_player_tick` so that the replay produced by reconciliation
@@ -766,28 +828,6 @@ pub(crate) fn gather_local_input(
 /// server's authoritative pose).  Keeping the logic in one place is what
 /// makes prediction stable — divergence between predict and replay would
 /// produce visible jitter on every snapshot.
-/// Two-zone Y clamp: surface map OR metro level, with the void between
-/// them strictly forbidden.  Anything that lands in the void zone (e.g.
-/// a buggy collide-resolve push) is snapped to whichever side it's
-/// closer to.  The teleport system bypasses this by setting positions
-/// inside one of the legal zones, so legitimate descents work.
-#[inline]
-fn clamp_player_y(y: f32) -> f32 {
-    let half = crate::map::MAP_HEIGHT * 0.5;
-    let surface_top = half - PLAYER_RADIUS;
-    let surface_bot = -half + PLAYER_RADIUS;
-    let metro_top = crate::underground::UNDER_TOP - PLAYER_RADIUS;
-    let metro_bot = crate::underground::UNDER_BOTTOM + PLAYER_RADIUS;
-    // Threshold roughly halfway between the two legal zones — anything
-    // above this snaps into the surface, anything below into the metro.
-    let split = (-half + crate::underground::UNDER_TOP) * 0.5;
-    if y > split {
-        y.clamp(surface_bot, surface_top)
-    } else {
-        y.clamp(metro_bot, metro_top)
-    }
-}
-
 pub fn apply_input_to_local(
     transform: &mut Transform,
     player: &mut Player,
@@ -795,7 +835,16 @@ pub fn apply_input_to_local(
     obstacles: &MapObstacles,
     dt: f32,
 ) {
-    let mv = Vec2::new(input.move_x, input.move_y).normalize_or_zero();
+    // Same clamp as `server_player_tick`: preserve sub-unit analog magnitudes
+    // (mobile touch stick) and only normalise overlong vectors — prediction
+    // must match the authoritative sim exactly or every reconciliation
+    // replay overshoots and the local player rubber-bands.
+    let mv = Vec2::new(input.move_x, input.move_y);
+    let mv = if mv.length_squared() > 1.0 {
+        mv.normalize()
+    } else {
+        mv
+    };
     if mv != Vec2::ZERO {
         transform.translation += (mv * PLAYER_SPEED * dt).extend(0.0);
     }
@@ -855,7 +904,7 @@ fn client_local_predict(
 fn server_player_tick(
     time: Res<Time>,
     local: Res<LocalInput>,
-    remote: Res<RemoteInputs>,
+    mut remote: ResMut<RemoteInputs>,
     ctx: Res<NetContext>,
     obstacles: Res<MapObstacles>,
     mut players: Query<(&mut Transform, &mut Player)>,
@@ -943,6 +992,17 @@ fn server_player_tick(
                 }
             }
             _ => {}
+        }
+        // Slot switch consumed: zero the stored remote entry so the
+        // drain-merge in sync.rs (`if merged.switch_slot == 0 { merged.
+        // switch_slot = prev.switch_slot; }`) stops re-sticking it forever —
+        // without this a single '1' press would keep reverting every later
+        // weapon pickup back to the pistol slot.  The local player's latch is
+        // cleared by `clear_one_shot_inputs` after this system.
+        if input.switch_slot != 0 && player.id != ctx.my_id {
+            if let Some(ri) = remote.0.get_mut(&player.id) {
+                ri.switch_slot = 0;
+            }
         }
 
         // Reload logic (auto-reload when magazine empty, or manual with R)
